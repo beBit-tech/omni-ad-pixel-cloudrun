@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  pixel-tracker:
+    build: .
+    ports:
+      - "8070:8070"
+    environment:
+      - GCS_BUCKET=${GCS_BUCKET:-test-bucket}
+      - GCS_PROJECT=${GCS_PROJECT:-test-project}
+      - COOKIE_DOMAIN=${COOKIE_DOMAIN:-.localhost}
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key}
+      - WORKERS=2
+    volumes:
+      - ~/.config/gcloud:/root/.config/gcloud:ro
+      - ./data:/app/local_data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8070/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - pixel-network
+
+networks:
+  pixel-network:
+    driver: bridge
