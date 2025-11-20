@@ -2,12 +2,13 @@ version: '3.8'
 
 services:
   pixel-tracker:
+    user: root
     build: .
     ports:
       - "8070:8070"
     environment:
-      - GCS_BUCKET=${GCS_BUCKET:-test-bucket}
-      - GCS_PROJECT=${GCS_PROJECT:-test-project}
+      # - GCS_BUCKET=${GCS_BUCKET:-test-bucket}
+      # - GCS_PROJECT=${GCS_PROJECT:-test-project}
       - COOKIE_DOMAIN=${COOKIE_DOMAIN:-.localhost}
       - SECRET_KEY=${SECRET_KEY:-dev-secret-key}
       - WORKERS=2
