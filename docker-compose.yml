@@ -6,15 +6,18 @@ services:
     build: .
     ports:
       - "8070:8070"
+  
     environment:
-      # - GCS_BUCKET=${GCS_BUCKET:-test-bucket}
-      # - GCS_PROJECT=${GCS_PROJECT:-test-project}
-      - COOKIE_DOMAIN=${COOKIE_DOMAIN:-.localhost}
-      - SECRET_KEY=${SECRET_KEY:-dev-secret-key}
-      - WORKERS=2
+      - DEBUG=true
+      - ENVIRONMENT=development
+      - GCS_BUCKET=${GCS_BUCKET}
+      - GCS_PROJECT=${GCS_PROJECT}
+      - COOKIE_DOMAIN=${COOKIE_DOMAIN}
+      - SECRET_KEY=${SECRET_KEY}
+      - WORKERS=${WORKERS:-4}
+    command: python3 app.py
     volumes:
-      - ~/.config/gcloud:/root/.config/gcloud:ro
-      - ./data:/app/local_data
+      - .:/app
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8070/health"]
       interval: 30s

@@ -3,7 +3,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from threading import Lock, Thread
 
 from flask import Flask, jsonify, make_response, redirect, request, url_for
@@ -53,7 +53,7 @@ def pixel():
         cid = request.args.get('cid')
         partner = request.args.get('partner')
         mapping_id = request.cookies.get(COOKIE_NAME)
-        
+
         if cid is None or partner is None:
             return make_response('', 204)
 
@@ -64,12 +64,11 @@ def pixel():
         'cid': cid,
         'partner': partner,
         'mapping_id': mapping_id,
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(UTC).isoformat(),
         'ip_address': request.headers.get('X-Forwarded-For', request.remote_addr),
         'user_agent': request.headers.get('User-Agent', ''),
         'referer': request.headers.get('Referer', ''),
-        'query_params': dict(request.args),
-        'date': datetime.utcnow().strftime('%Y-%m-%d'),
+        'date': datetime.now(UTC).strftime('%Y-%m-%d'),
     }
         buffer_writer.add(data)
 
@@ -86,13 +85,12 @@ def pixel():
             }
 
             response.set_cookie(COOKIE_NAME, mapping_id, **cookie_kwargs)
-            logger.info(f"Set new cookie for CID: {cid}")
 
         return response
 
     except Exception as e:
         logger.error(f"Error processing pixel request: {e}", exc_info=True)
-        return redirect('/pixel.gif', code=302)
+        return make_response('', 204)
 
 
 @app.route('/pixel.gif', methods=['GET'])
@@ -108,12 +106,11 @@ def pixel_gif():
             'cid': cid,
             'partner': partner,
             'mapping_id': mapping_id,
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(UTC).isoformat(),
             'ip_address': request.headers.get('X-Forwarded-For', request.remote_addr),
             'user_agent': request.headers.get('User-Agent', ''),
             'referer': request.headers.get('Referer', ''),
-            'query_params': dict(request.args),
-            'date': datetime.utcnow().strftime('%Y-%m-%d'),
+            'date': datetime.now(UTC).strftime('%Y-%m-%d'),
             'third_party_success': True
         }
         buffer_writer.add(data)
@@ -141,4 +138,6 @@ def index():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8070))
     logger.info(f"Starting Flask app on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    debug_mode = os.environ.get('DEBUG', 'false').lower() == 'true'
+    logger.info(f"Debug mode is {'on' if debug_mode else 'off'}")
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)

@@ -90,7 +90,7 @@ class BufferWriter:
         df = pl.DataFrame(cleaned_data)
 
         df = df.with_columns([
-            pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%dT%H:%M:%S%.f'),
+            pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%dT%H:%M:%S%.f%z'),
             pl.col('date').str.strptime(pl.Date, '%Y-%m-%d')
         ])
 
