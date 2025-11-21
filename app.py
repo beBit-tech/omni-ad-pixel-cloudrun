@@ -51,15 +51,18 @@ def cleanup():
 def pixel():
     try:
         cid = request.args.get('cid')
-        partner_id = request.args.get('partner_id','')
+        partner = request.args.get('partner')
         mapping_id = request.cookies.get(COOKIE_NAME)
+        
+        if cid is None or partner is None:
+            return make_response('', 204)
 
         if not mapping_id:
             mapping_id = str(uuid.uuid4())
 
         data = {
         'cid': cid,
-        'partner_id': partner_id,
+        'partner': partner,
         'mapping_id': mapping_id,
         'timestamp': datetime.utcnow().isoformat(),
         'ip_address': request.headers.get('X-Forwarded-For', request.remote_addr),
@@ -70,16 +73,7 @@ def pixel():
     }
         buffer_writer.add(data)
 
-        if cid is  None or cid is None:
-            gif_data = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
-            response = make_response(gif_data)
-            response.headers['Content-Type'] = 'image/gif'
-            response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
-            response.headers['Pragma'] = 'no-cache'
-            response.headers['Expires'] = '0'
-            return make_response(response)
-
-        redirect_url = url_for('pixel_gif', cid=cid, mid=mapping_id)
+        redirect_url = url_for('pixel_gif', cid=cid, mid=mapping_id, partner=partner)
         response = make_response(redirect(redirect_url, code=302))
 
         if COOKIE_NAME not in request.cookies:
@@ -108,11 +102,11 @@ def pixel_gif():
     if third_party_success:
         cid = request.args.get('cid')
         mapping_id = request.cookies.get(COOKIE_NAME)
-        partner_id = request.args.get('partner_id','')
+        partner = request.args.get('partner','')
 
         data = {
             'cid': cid,
-            'partner_id': partner_id,
+            'partner': partner,
             'mapping_id': mapping_id,
             'timestamp': datetime.utcnow().isoformat(),
             'ip_address': request.headers.get('X-Forwarded-For', request.remote_addr),
@@ -139,7 +133,7 @@ def index():
         'service': 'Pixel Tracker API',
         'version': '1.0.0',
         'endpoints': {
-            'pixel': '/pixel?partner_id=xxx&cid=yyy',
+            'pixel': '/pixel?partner=xxx&cid=yyy',
         }
     }), 200
 
