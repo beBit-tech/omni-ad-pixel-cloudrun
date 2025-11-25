@@ -21,22 +21,14 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', str(uuid.uuid4()))
 
 
-GCS_BUCKET = os.environ.get('GCS_BUCKET')
-GCS_PROJECT = os.environ.get('GCS_PROJECT')
 COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN')
 COOKIE_NAME = 'm_id'
 COOKIE_MAX_AGE = 365 * 24 * 60 * 60
 
-if not GCS_BUCKET:
-    logger.warning("GCS_BUCKET not set, data will not be persisted")
-if not GCS_PROJECT:
-    logger.warning("GCS_PROJECT not set")
-
 buffer_writer = BufferWriter(
-    gcs_bucket=GCS_BUCKET,
-    gcs_project=GCS_PROJECT,
     buffer_size=10000,
-    buffer_time=60
+    buffer_time=60,
+    parquet_dir="./local_data/parquet_data"
 )
 
 buffer_writer.start()
@@ -89,7 +81,7 @@ def pixel():
         return response
 
     except Exception as e:
-        logger.error(f"Error processing pixel request: {e}", exc_info=True)
+        logger.error("Error processing pixel request: %s", e, exc_info=True)
         return make_response('', 204)
 
 
@@ -137,7 +129,7 @@ def index():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8070))
-    logger.info(f"Starting Flask app on port {port}")
+    logger.info("Starting Flask app on port %d", port)
     debug_mode = os.environ.get('DEBUG', 'false').lower() == 'true'
-    logger.info(f"Debug mode is {'on' if debug_mode else 'off'}")
+    logger.info("Debug mode is %s", 'on' if debug_mode else 'off')
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
