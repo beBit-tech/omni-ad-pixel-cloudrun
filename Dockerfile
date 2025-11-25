@@ -25,8 +25,8 @@ ENV PYTHONUNBUFFERED=1
 
 CMD exec gunicorn \
     --bind :$PORT \
-    --workers ${WORKERS:-4} \
-    --threads 8 \
+    --workers 8 \
+    --threads 24 \
     --worker-class gthread \
     --timeout 0 \
     --access-logfile - \
