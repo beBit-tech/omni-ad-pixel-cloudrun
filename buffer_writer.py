@@ -1,24 +1,22 @@
 import logging
 import os
+import uuid
 import time
 from datetime import datetime
 from threading import Event, Lock, Thread
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import polars as pl
-from deltalake import write_deltalake
 from google.cloud import storage
 
 logger = logging.getLogger(__name__)
 
 class BufferWriter:
-    def __init__(self, gcs_bucket: str, gcs_project: str,
-                 buffer_size: int = 10000, buffer_time: int = 60):
-
-        self.gcs_bucket = gcs_bucket
-        self.gcs_project = gcs_project
+    def __init__(self, buffer_size: int = 10000, buffer_time: int = 60, gcs_bucket: Optional[str] = None, gcs_project: Optional[str] = None):
         self.buffer_size = buffer_size
         self.buffer_time = buffer_time
+        self.gcs_bucket = gcs_bucket
+        self.gcs_project = gcs_project
 
         self.buffer: list[dict[str, Any]] = []
         self.buffer_lock = Lock()
@@ -31,117 +29,80 @@ class BufferWriter:
         self.write_thread = None
         self.last_flush_time = time.time()
 
-        self._storage_client = None
+        self.gcs_client = None
+        if self.gcs_bucket:
+            try:
+                self.gcs_client = storage.Client(project=self.gcs_project)
+                logger.info("GCS client initialized for bucket: %s", self.gcs_bucket)
+            except Exception as e:
+                logger.error("Failed to initialize GCS client: %s", e)
 
-        logger.info(f"BufferWriter initialized: buffer_size={buffer_size}, "
-                   f"buffer_time={buffer_time}s, bucket={gcs_bucket}")
+        logger.info("BufferWriter initialized: buffer_size=%d, buffer_time=%ds, gcs_bucket=%s", buffer_size, buffer_time, gcs_bucket or "None")
 
-    @property
-    def storage_client(self):
-        if self._storage_client is None and self.gcs_project:
-            self._storage_client = storage.Client(project=self.gcs_project)
-        return self._storage_client
-
-    def add(self, data: dict[str, Any]):
+    def add(self, data: dict[str, Any]) -> None:
         with self.buffer_lock:
             self.buffer.append(data)
             self.total_buffered += 1
 
             if len(self.buffer) >= self.buffer_size:
-                logger.info(f"Buffer size reached {len(self.buffer)}, triggering flush")
+                logger.info("Buffer size reached %d, triggering flush", len(self.buffer))
                 self._flush_buffer()
 
     def _flush_buffer(self):
         if not self.buffer:
             return
-
-        is_local = not os.environ.get('GOOGLE_APPLICATION_CREDENTIALS') and not self.gcs_bucket
-
-        if not self.gcs_bucket and not is_local:
-            logger.warning("GCS_BUCKET not configured and not in local mode, discarding buffer")
-            self.buffer.clear()
-            return
-
         try:
             data_to_write = self.buffer.copy()
             self.buffer.clear()
-            self._write_to_delta_lake(data_to_write)
+            self._write_to_parquet(data_to_write)
 
             self.total_written += len(data_to_write)
             self.last_write = datetime.utcnow().isoformat()
             self.last_flush_time = time.time()
 
-            logger.info(f"Successfully wrote {len(data_to_write)} records to Delta Lake")
-
+            logger.info("Successfully wrote %d records to Parquet", len(data_to_write))
         except Exception as e:
-            logger.error(f"Error flushing buffer: {e}", exc_info=True)
+            logger.error("Error flushing buffer: %s", e, exc_info=True)
 
-    def _write_to_delta_lake(self, data: list[dict[str, Any]]):
+    def _write_to_parquet(self, data: list[dict[str, Any]]) -> None:
         if not data:
             return
 
-        cleaned_data = []
-        for record in data:
-            clean_record = {}
-            for key, value in record.items():
-                clean_record[key] = "" if value is None else value
-            cleaned_data.append(clean_record)
+        df = pl.DataFrame(data)
 
-        df = pl.DataFrame(cleaned_data)
+        partition_col = 'date'
+        if partition_col in df.columns:
+            df = df.with_columns([
+                pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%dT%H:%M:%S%.f%z', strict=False),
+                pl.col('date').str.strptime(pl.Date, '%Y-%m-%d', strict=False)
+            ])
+        unique_dates = df[partition_col].unique().to_list()
 
-        df = df.with_columns([
-            pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%dT%H:%M:%S%.f%z'),
-            pl.col('date').str.strptime(pl.Date, '%Y-%m-%d')
-        ])
-
-        arrow_table = df.to_arrow()
-
-        if not os.environ.get('GOOGLE_APPLICATION_CREDENTIALS') and not self.gcs_bucket:
-            local_path = "./local_data/delta_lake/"
-            os.makedirs(local_path, exist_ok=True)
-            delta_path = local_path
-            storage_options = None
-            logger.info(f"Writing to local Delta Lake: {delta_path}")
-        else:
-            delta_path = f"gs://{self.gcs_bucket}/pixel-data"
-            storage_options = {}
-            if self.gcs_project:
-                storage_options['project_id'] = self.gcs_project
-            logger.info(f"Writing to GCS Delta Lake: {delta_path}")
-
-        write_deltalake(
-            delta_path,
-            arrow_table,
-            storage_options=storage_options,
-            mode='append',
-            partition_by=['date'],
-            schema_mode='merge'
-        )
-
-        logger.info(f"Write completed: {len(data)} records")
+        for date_val in unique_dates:
+            if self.gcs_client:
+                parquet_file = f"gs://{self.gcs_bucket}/date={date_val}/{str(uuid.uuid4())}.parquet"
+                part_df = df.filter(pl.col(partition_col) == date_val)
+                part_df.write_parquet(parquet_file)
+                logger.info("Write completed: %d records to %s", len(part_df), parquet_file)
 
     def _background_flush(self):
-        """背景執行緒:定期檢查並寫入緩衝區"""
         logger.info("Background flush thread started")
 
         while not self.stop_event.is_set():
             try:
                 time.sleep(1)
-
                 time_elapsed = time.time() - self.last_flush_time
-
                 with self.buffer_lock:
                     if self.buffer and time_elapsed >= self.buffer_time:
-                        logger.info(f"Buffer time reached {time_elapsed:.1f}s, triggering flush")
+                        logger.info("Buffer time reached %.1fs, triggering flush", time_elapsed)
                         self._flush_buffer()
 
             except Exception as e:
-                logger.error(f"Error in background flush: {e}", exc_info=True)
+                logger.error("Error in background flush: %s", e, exc_info=True)
 
         logger.info("Background flush thread stopped")
 
     def start(self):
-        """啟動背景寫入執行緒"""
         if self.write_thread is None or not self.write_thread.is_alive():
             self.stop_event.clear()
             self.write_thread = Thread(target=self._background_flush, daemon=True)
@@ -149,7 +110,6 @@ class BufferWriter:
             logger.info("BufferWriter started")
 
     def stop(self):
-        """停止背景執行緒並寫入剩餘資料"""
         logger.info("Stopping BufferWriter...")
 
         self.stop_event.set()
@@ -159,7 +119,7 @@ class BufferWriter:
 
         with self.buffer_lock:
             if self.buffer:
-                logger.info(f"Flushing remaining {len(self.buffer)} records")
+                logger.info("Flushing remaining %d records", len(self.buffer))
                 self._flush_buffer()
 
         logger.info("BufferWriter stopped")

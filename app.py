@@ -16,10 +16,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', str(uuid.uuid4()))
-
 
 GCS_BUCKET = os.environ.get('GCS_BUCKET')
 GCS_PROJECT = os.environ.get('GCS_PROJECT')
@@ -36,7 +34,7 @@ buffer_writer = BufferWriter(
     gcs_bucket=GCS_BUCKET,
     gcs_project=GCS_PROJECT,
     buffer_size=10000,
-    buffer_time=60
+    buffer_time=10,
 )
 
 buffer_writer.start()
