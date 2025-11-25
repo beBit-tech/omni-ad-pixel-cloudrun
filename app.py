@@ -33,8 +33,8 @@ if not GCS_PROJECT:
 buffer_writer = BufferWriter(
     gcs_bucket=GCS_BUCKET,
     gcs_project=GCS_PROJECT,
-    buffer_size=10000,
-    buffer_time=60,
+    buffer_size=15000,
+    buffer_time=240,
 )
 
 buffer_writer.start()
