@@ -34,7 +34,7 @@ buffer_writer = BufferWriter(
     gcs_bucket=GCS_BUCKET,
     gcs_project=GCS_PROJECT,
     buffer_size=10000,
-    buffer_time=10,
+    buffer_time=60,
 )
 
 buffer_writer.start()
@@ -91,7 +91,7 @@ def track_pixel():
                 COOKIE_NAME,
                 mapping_id,
                 max_age=COOKIE_MAX_AGE,
-                domain=COOKIE_DOMAIN,
+                domain=request.host,
                 httponly=True,
                 secure=True,
                 samesite='None'
