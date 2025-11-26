@@ -1,5 +1,5 @@
 import logging
-import os
+import io
 import uuid
 import time
 from datetime import datetime
@@ -11,8 +11,15 @@ from google.cloud import storage
 
 logger = logging.getLogger(__name__)
 
+
 class BufferWriter:
-    def __init__(self, buffer_size: int = 10000, buffer_time: int = 60, gcs_bucket: Optional[str] = None, gcs_project: Optional[str] = None):
+    def __init__(
+        self,
+        buffer_size: int = 10000,
+        buffer_time: int = 60,
+        gcs_bucket: Optional[str] = None,
+        gcs_project: Optional[str] = None,
+    ):
         self.buffer_size = buffer_size
         self.buffer_time = buffer_time
         self.gcs_bucket = gcs_bucket
@@ -30,14 +37,22 @@ class BufferWriter:
         self.last_flush_time = time.time()
 
         self.gcs_client = None
+        self.bucket = None
+
         if self.gcs_bucket:
             try:
                 self.gcs_client = storage.Client(project=self.gcs_project)
-                logger.info("GCS client initialized for bucket: %s", self.gcs_bucket)
+                self.bucket = self.gcs_client.bucket(self.gcs_bucket)
+                logger.info(f"GCS initialized: bucket={self.gcs_bucket}")
             except Exception as e:
                 logger.error("Failed to initialize GCS client: %s", e)
 
-        logger.info("BufferWriter initialized: buffer_size=%d, buffer_time=%ds, gcs_bucket=%s", buffer_size, buffer_time, gcs_bucket or "None")
+        logger.info(
+            "BufferWriter initialized: buffer_size=%d buffer_time=%ds bucket=%s",
+            buffer_size,
+            buffer_time,
+            gcs_bucket or "None",
+        )
 
     def add(self, data: dict[str, Any]) -> None:
         with self.buffer_lock:
@@ -45,7 +60,7 @@ class BufferWriter:
             self.total_buffered += 1
 
             if len(self.buffer) >= self.buffer_size:
-                logger.info("Buffer size reached %d, triggering flush", len(self.buffer))
+                logger.info("Buffer size %d reached, flushing...", len(self.buffer))
                 self._flush_buffer()
 
     def _flush_buffer(self):
@@ -64,26 +79,51 @@ class BufferWriter:
         except Exception as e:
             logger.error("Error flushing buffer: %s", e, exc_info=True)
 
-    def _write_to_parquet(self, data: list[dict[str, Any]]) -> None:
+    def _write_to_parquet(self, data: list[dict[str, Any]]):
         if not data:
             return
 
         df = pl.DataFrame(data)
 
-        partition_col = 'date'
-        if partition_col in df.columns:
-            df = df.with_columns([
-                pl.col('timestamp').str.strptime(pl.Datetime, '%Y-%m-%dT%H:%M:%S%.f%z', strict=False),
-                pl.col('date').str.strptime(pl.Date, '%Y-%m-%d', strict=False)
-            ])
-        unique_dates = df[partition_col].unique().to_list()
+        if "timestamp" in df.columns:
+            df = df.with_columns(
+                pl.col("timestamp").str.strptime(pl.Datetime, strict=False)
+            )
+        if "date" in df.columns:
+            df = df.with_columns(
+                pl.col("date").str.strptime(pl.Date, strict=False)
+            )
+        if "date" in df.columns:
+            dates = df["date"].unique().to_list()
+        else:
+            dates = [None]
 
-        for date_val in unique_dates:
-            if self.gcs_client:
-                parquet_file = f"gs://{self.gcs_bucket}/date={date_val}/{str(uuid.uuid4())}.parquet"
-                part_df = df.filter(pl.col(partition_col) == date_val)
-                part_df.write_parquet(parquet_file)
-                logger.info("Write completed: %d records to %s", len(part_df), parquet_file)
+        for date_val in dates:
+            if date_val is None:
+                part = df
+                prefix = ""
+            else:
+                part = df.filter(pl.col("date") == date_val)
+                prefix = f"date={date_val}/"
+
+            buf = io.BytesIO()
+            part.write_parquet(buf)
+            parquet_bytes = buf.getvalue()
+
+            blob_name = f"{prefix}{uuid.uuid4().hex}.parquet"
+            blob = self.bucket.blob(blob_name)
+            blob.upload_from_string(
+                parquet_bytes,
+                content_type="application/octet-stream"
+            )
+
+            logger.info(
+                "GCS uploaded: gs://%s/%s rows=%d",
+                self.gcs_bucket,
+                blob_name,
+                len(part),
+            )
+
 
     def _background_flush(self):
         logger.info("Background flush thread started")
@@ -105,7 +145,10 @@ class BufferWriter:
     def start(self):
         if self.write_thread is None or not self.write_thread.is_alive():
             self.stop_event.clear()
-            self.write_thread = Thread(target=self._background_flush, daemon=True)
+            self.write_thread = Thread(
+                target=self._background_flush,
+                daemon=True
+            )
             self.write_thread.start()
             logger.info("BufferWriter started")
 
@@ -119,7 +162,7 @@ class BufferWriter:
 
         with self.buffer_lock:
             if self.buffer:
-                logger.info("Flushing remaining %d records", len(self.buffer))
+                logger.info("Flushing remaining %d rows...", len(self.buffer))
                 self._flush_buffer()
 
         logger.info("BufferWriter stopped")
