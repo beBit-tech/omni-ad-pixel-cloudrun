@@ -8,7 +8,7 @@ from threading import Lock, Thread
 
 from flask import Flask, jsonify, make_response, redirect, request, url_for
 
-from buffer_writer import BufferWriter
+import queue_singleton
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,30 +19,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', str(uuid.uuid4()))
 
-GCS_BUCKET = os.environ.get('GCS_BUCKET')
-GCS_PROJECT = os.environ.get('GCS_PROJECT')
-COOKIE_DOMAIN = os.environ.get('COOKIE_DOMAIN')
 COOKIE_NAME = 'mapping_id'
 COOKIE_MAX_AGE = 365 * 24 * 60 * 60
-
-if not GCS_BUCKET:
-    logger.warning("GCS_BUCKET not set, data will not be persisted")
-if not GCS_PROJECT:
-    logger.warning("GCS_PROJECT not set")
-
-buffer_writer = BufferWriter(
-    gcs_bucket=GCS_BUCKET,
-    gcs_project=GCS_PROJECT,
-    buffer_size=15000,
-    buffer_time=240,
-)
-
-buffer_writer.start()
-
-@atexit.register
-def cleanup():
-    logger.info("Shutting down buffer writer...")
-    buffer_writer.stop()
 
 @app.route('/track', methods=['GET'])
 def track_pixel():
@@ -78,7 +56,14 @@ def track_pixel():
             'date': datetime.now(UTC).strftime('%Y-%m-%d'),
             'origin': origin,
         }
-        buffer_writer.add(data)
+        
+        q = queue_singleton.get_queue()
+        if q is not None:
+            try:
+                q.put_nowait(data)
+            except Exception:
+                logger.exception("Failed to enqueue record")
+
 
         response = make_response(jsonify({'mapping_id': mapping_id, 'is_created': is_created}), 200)
         if origin is not None:

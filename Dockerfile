@@ -11,8 +11,7 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
-COPY buffer_writer.py .
+COPY . .
 
 RUN useradd -m -u 1000 appuser && \
     chown -R appuser:appuser /app
@@ -26,9 +25,10 @@ ENV PYTHONUNBUFFERED=1
 CMD exec gunicorn \
     --bind :$PORT \
     --workers 8 \
-    --threads 50 \
+    --threads 40 \
     --worker-class gthread \
     --timeout 0 \
+    --config /app/gunicorn.conf.py \
     --access-logfile - \
     --error-logfile - \
     --log-level info \
