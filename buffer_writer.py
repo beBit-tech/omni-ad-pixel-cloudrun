@@ -36,6 +36,7 @@ class BufferWriter:
         self.stop_event = Event()
         self.write_thread = None
         self.buffer_start_time = None
+        self.is_flushing = False
 
         self.gcs_client = None
         self.bucket = None
@@ -64,13 +65,16 @@ class BufferWriter:
             self.total_buffered += 1
 
     def _flush_buffer(self):
-        if not self.buffer:
-            return
-        try:
+        with self.buffer_lock:
+            if not self.buffer or self.is_flushing:
+                return
+
+            self.is_flushing = True
             data_to_write = self.buffer.copy()
             self.buffer.clear()
             self.buffer_start_time = None
 
+        try:
             self._write_to_parquet(data_to_write)
 
             self.total_written += len(data_to_write)
@@ -79,6 +83,9 @@ class BufferWriter:
             logger.info("Successfully wrote %d records to Parquet", len(data_to_write))
         except Exception as e:
             logger.error("Error flushing buffer: %s", e, exc_info=True)
+        finally:
+            with self.buffer_lock:
+                self.is_flushing = False
 
     def _write_to_parquet(self, data: list[dict[str, Any]]):
         if not data:
