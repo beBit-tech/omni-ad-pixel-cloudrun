@@ -34,7 +34,6 @@ ENV/
 env.bak/
 venv.bak/
 
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -44,6 +43,8 @@ venv.bak/
 *.log
 service-account-key.json
 *.json
+!.vscode/*.json
+!pyproject.toml
 
 local_data/
 tmp/

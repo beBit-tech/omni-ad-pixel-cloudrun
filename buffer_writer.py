@@ -1,10 +1,10 @@
-import logging
 import io
-import uuid
+import logging
 import time
+import uuid
 from datetime import datetime
 from threading import Event, Lock, Thread
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 import polars as pl
 from google.cloud import storage
@@ -86,13 +86,9 @@ class BufferWriter:
         df = pl.DataFrame(data)
 
         if "timestamp" in df.columns:
-            df = df.with_columns(
-                pl.col("timestamp").str.strptime(pl.Datetime, strict=False)
-            )
+            df = df.with_columns(pl.col("timestamp").str.strptime(pl.Datetime, strict=False))
         if "date" in df.columns:
-            df = df.with_columns(
-                pl.col("date").str.strptime(pl.Date, strict=False)
-            )
+            df = df.with_columns(pl.col("date").str.strptime(pl.Date, strict=False))
         if "date" in df.columns:
             dates = df["date"].unique().to_list()
         else:
@@ -112,10 +108,7 @@ class BufferWriter:
 
             blob_name = f"{prefix}{uuid.uuid4().hex}.parquet"
             blob = self.bucket.blob(blob_name)
-            blob.upload_from_string(
-                parquet_bytes,
-                content_type="application/octet-stream"
-            )
+            blob.upload_from_string(parquet_bytes, content_type="application/octet-stream")
 
             logger.info(
                 "GCS uploaded: gs://%s/%s rows=%d",
@@ -123,7 +116,6 @@ class BufferWriter:
                 blob_name,
                 len(part),
             )
-
 
     def _background_flush(self):
         logger.info("Background flush thread started")
@@ -145,10 +137,7 @@ class BufferWriter:
     def start(self):
         if self.write_thread is None or not self.write_thread.is_alive():
             self.stop_event.clear()
-            self.write_thread = Thread(
-                target=self._background_flush,
-                daemon=True
-            )
+            self.write_thread = Thread(target=self._background_flush, daemon=True)
             self.write_thread.start()
             logger.info("BufferWriter started")
 

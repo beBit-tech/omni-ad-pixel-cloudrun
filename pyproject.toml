@@ -1,0 +1,23 @@
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "F",  # pyflakes
+    "W",  # pycodestyle warnings
+    "I",  # isort
+]
+ignore = []
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.isort]
+force-single-line = false
+lines-after-imports = 2
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "auto"
