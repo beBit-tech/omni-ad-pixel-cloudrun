@@ -57,16 +57,11 @@ class BufferWriter:
 
     def add(self, data: dict[str, Any]) -> None:
         with self.buffer_lock:
-            # Start timing when first data arrives
             if not self.buffer:
                 self.buffer_start_time = time.time()
 
             self.buffer.append(data)
             self.total_buffered += 1
-
-            if len(self.buffer) >= self.buffer_size:
-                logger.info("Buffer size %d reached, flushing...", len(self.buffer))
-                self._flush_buffer()
 
     def _flush_buffer(self):
         if not self.buffer:
@@ -129,12 +124,20 @@ class BufferWriter:
         while not self.stop_event.is_set():
             try:
                 time.sleep(1)
+
                 with self.buffer_lock:
-                    if self.buffer and self.buffer_start_time:
-                        time_elapsed = time.time() - self.buffer_start_time
-                        if time_elapsed >= self.buffer_time:
-                            logger.info("Buffer time reached %.1fs, triggering flush", time_elapsed)
-                            self._flush_buffer()
+                    if not self.buffer or not self.buffer_start_time:
+                        continue
+
+                    buffer_size = len(self.buffer)
+                    time_elapsed = time.time() - self.buffer_start_time
+
+                if buffer_size >= self.buffer_size:
+                    logger.info("Buffer size %d reached, triggering flush", buffer_size)
+                    self._flush_buffer()
+                elif time_elapsed >= self.buffer_time:
+                    logger.info("Buffer time %.1fs reached, triggering flush", time_elapsed)
+                    self._flush_buffer()
 
             except Exception as e:
                 logger.error("Error in background flush: %s", e, exc_info=True)
