@@ -1,5 +1,6 @@
 import io
 import logging
+import signal
 import time
 import uuid
 from datetime import datetime
@@ -140,11 +141,19 @@ class BufferWriter:
 
         logger.info("Background flush thread stopped")
 
+    def _signal_handler(self, signum, frame):
+        logger.warning(f"Received signal {signum}, initiating shutdown...")
+        self.stop()
+
     def start(self):
         if self.write_thread is None or not self.write_thread.is_alive():
             self.stop_event.clear()
             self.write_thread = Thread(target=self._background_flush, daemon=True)
             self.write_thread.start()
+
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
+
             logger.info("BufferWriter started")
 
     def stop(self):

@@ -1,4 +1,3 @@
-import atexit
 import base64
 import json
 import logging
@@ -36,12 +35,6 @@ buffer_writer = BufferWriter(
 )
 
 buffer_writer.start()
-
-
-@atexit.register
-def cleanup():
-    logger.info("Shutting down buffer writer...")
-    buffer_writer.stop()
 
 
 PIXEL_GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
