@@ -34,7 +34,7 @@ class BufferWriter:
 
         self.stop_event = Event()
         self.write_thread = None
-        self.last_flush_time = time.time()
+        self.buffer_start_time = None
 
         self.gcs_client = None
         self.bucket = None
@@ -56,6 +56,10 @@ class BufferWriter:
 
     def add(self, data: dict[str, Any]) -> None:
         with self.buffer_lock:
+            # Start timing when first data arrives
+            if not self.buffer:
+                self.buffer_start_time = time.time()
+
             self.buffer.append(data)
             self.total_buffered += 1
 
@@ -69,11 +73,12 @@ class BufferWriter:
         try:
             data_to_write = self.buffer.copy()
             self.buffer.clear()
+            self.buffer_start_time = None
+
             self._write_to_parquet(data_to_write)
 
             self.total_written += len(data_to_write)
             self.last_write = datetime.utcnow().isoformat()
-            self.last_flush_time = time.time()
 
             logger.info("Successfully wrote %d records to Parquet", len(data_to_write))
         except Exception as e:
@@ -123,11 +128,12 @@ class BufferWriter:
         while not self.stop_event.is_set():
             try:
                 time.sleep(1)
-                time_elapsed = time.time() - self.last_flush_time
                 with self.buffer_lock:
-                    if self.buffer and time_elapsed >= self.buffer_time:
-                        logger.info("Buffer time reached %.1fs, triggering flush", time_elapsed)
-                        self._flush_buffer()
+                    if self.buffer and self.buffer_start_time:
+                        time_elapsed = time.time() - self.buffer_start_time
+                        if time_elapsed >= self.buffer_time:
+                            logger.info("Buffer time reached %.1fs, triggering flush", time_elapsed)
+                            self._flush_buffer()
 
             except Exception as e:
                 logger.error("Error in background flush: %s", e, exc_info=True)
