@@ -31,7 +31,7 @@ buffer_writer = BufferWriter(
     gcs_bucket=GCS_BUCKET,
     gcs_project=GCS_PROJECT,
     buffer_size=500000,
-    buffer_time=10,
+    buffer_time=5 * 60,
 )
 
 buffer_writer.start()
@@ -56,13 +56,13 @@ def validate_redirect_url(url):
     parsed = urlparse(decoded)
 
     if parsed.scheme not in ["http", "https"]:
-        print("Invalid scheme:", parsed.scheme)
+        logger.warning("Invalid scheme: %s", parsed.scheme)
         return None
     if not parsed.hostname:
-        print("No hostname found")
+        logger.warning("No hostname found")
         return None
     if parsed.hostname not in ALLOWED_REDIRECT_HOSTS:
-        print("Hostname not allowed:", parsed.hostname)
+        logger.warning("Hostname not allowed: %s", parsed.hostname)
         return None
 
     return decoded
