@@ -87,10 +87,30 @@ class BufferWriter:
             with self.buffer_lock:
                 self.is_flushing = False
 
-    def _write_to_parquet(self, data: list[dict[str, Any]]):
+    def _write_to_parquet(self, data: list[dict[str, Any]], max_retries: int = 3):
         if not data:
             return
 
+        for attempt in range(max_retries):
+            try:
+                self._do_write_parquet(data)
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait_time = 3**attempt
+                    logger.warning(
+                        "Write failed (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1,
+                        max_retries,
+                        wait_time,
+                        e,
+                    )
+                    time.sleep(wait_time)
+                else:
+                    logger.error("Write failed after %d attempts, data lost: %s", max_retries, e)
+                    raise
+
+    def _do_write_parquet(self, data: list[dict[str, Any]]):
         df = pl.DataFrame(data)
 
         if "timestamp" in df.columns:
