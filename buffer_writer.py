@@ -4,10 +4,12 @@ import signal
 import time
 import uuid
 from datetime import datetime
-from threading import Event, Lock, Thread
 from typing import Any, Optional
 
+import gevent
 import polars as pl
+from gevent.event import Event
+from gevent.lock import BoundedSemaphore
 from google.cloud import storage
 
 logger = logging.getLogger(__name__)
@@ -27,14 +29,14 @@ class BufferWriter:
         self.gcs_project = gcs_project
 
         self.buffer: list[dict[str, Any]] = []
-        self.buffer_lock = Lock()
+        self.buffer_lock = BoundedSemaphore()
 
         self.total_buffered = 0
         self.total_written = 0
         self.last_write = None
 
         self.stop_event = Event()
-        self.write_thread = None
+        self.write_greenlet = None
         self.buffer_start_time = None
         self.is_flushing = False
 
@@ -106,7 +108,7 @@ class BufferWriter:
                         wait_time,
                         e,
                     )
-                    time.sleep(wait_time)
+                    gevent.sleep(wait_time)
                 else:
                     logger.error("Write failed after %d attempts, data lost: %s", max_retries, e)
                     raise
@@ -147,11 +149,11 @@ class BufferWriter:
             )
 
     def _background_flush(self):
-        logger.info("Background flush thread started")
+        logger.info("Background flush greenlet started")
 
         while not self.stop_event.is_set():
             try:
-                time.sleep(1)
+                gevent.sleep(1)
 
                 should_flush = False
                 reason = ""
@@ -175,17 +177,16 @@ class BufferWriter:
             except Exception as e:
                 logger.error("Error in background flush: %s", e, exc_info=True)
 
-        logger.info("Background flush thread stopped")
+        logger.info("Background flush greenlet stopped")
 
     def _signal_handler(self, signum, frame):
         logger.warning(f"Received signal {signum}, initiating shutdown...")
         self.stop()
 
     def start(self):
-        if self.write_thread is None or not self.write_thread.is_alive():
+        if self.write_greenlet is None or self.write_greenlet.dead:
             self.stop_event.clear()
-            self.write_thread = Thread(target=self._background_flush, daemon=True)
-            self.write_thread.start()
+            self.write_greenlet = gevent.spawn(self._background_flush)
 
             signal.signal(signal.SIGTERM, self._signal_handler)
             signal.signal(signal.SIGINT, self._signal_handler)
@@ -197,8 +198,8 @@ class BufferWriter:
 
         self.stop_event.set()
 
-        if self.write_thread and self.write_thread.is_alive():
-            self.write_thread.join(timeout=5)
+        if self.write_greenlet and not self.write_greenlet.dead:
+            self.write_greenlet.join(timeout=5)
 
         with self.buffer_lock:
             has_data = len(self.buffer) > 0
