@@ -38,7 +38,12 @@ buffer_writer.start()
 
 
 PIXEL_GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
-ALLOWED_REDIRECT_HOSTS = ["onead.onevision.com.tw", "localhost"]
+ALLOWED_REDIRECT_HOSTS = [
+    "onead.onevision.com.tw",
+    "localhost",
+    "omnisegment.com",
+    "omniscientai.com",
+]
 
 
 def make_pixel_response():
@@ -47,6 +52,10 @@ def make_pixel_response():
     response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     response.headers["Access-Control-Allow-Origin"] = "*"
     return response
+
+
+def is_allowed_hostname(hostname, allowed_hosts):
+    return any(hostname == host or hostname.endswith(f".{host}") for host in allowed_hosts)
 
 
 def validate_redirect_url(url):
@@ -61,7 +70,11 @@ def validate_redirect_url(url):
     if not parsed.hostname:
         logger.warning("No hostname found")
         return None
-    if parsed.hostname not in ALLOWED_REDIRECT_HOSTS:
+
+    if not any(
+        parsed.hostname == host or parsed.hostname.endswith(f".{host}")
+        for host in ALLOWED_REDIRECT_HOSTS
+    ):
         logger.warning("Hostname not allowed: %s", parsed.hostname)
         return None
 
