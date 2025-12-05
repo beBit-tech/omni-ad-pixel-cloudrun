@@ -152,18 +152,23 @@ class BufferWriter:
             try:
                 time.sleep(1)
 
+                should_flush = False
+                reason = ""
+
                 with self.buffer_lock:
-                    if not self.buffer or not self.buffer_start_time:
-                        continue
+                    if self.buffer and self.buffer_start_time:
+                        buffer_size = len(self.buffer)
+                        time_elapsed = time.time() - self.buffer_start_time
 
-                    buffer_size = len(self.buffer)
-                    time_elapsed = time.time() - self.buffer_start_time
+                        if buffer_size >= self.buffer_size:
+                            should_flush = True
+                            reason = f"Buffer size {buffer_size} reached"
+                        elif time_elapsed >= self.buffer_time:
+                            should_flush = True
+                            reason = f"Buffer time {time_elapsed:.1f}s reached"
 
-                if buffer_size >= self.buffer_size:
-                    logger.info("Buffer size %d reached, triggering flush", buffer_size)
-                    self._flush_buffer()
-                elif time_elapsed >= self.buffer_time:
-                    logger.info("Buffer time %.1fs reached, triggering flush", time_elapsed)
+                if should_flush:
+                    logger.info("%s, triggering flush", reason)
                     self._flush_buffer()
 
             except Exception as e:
