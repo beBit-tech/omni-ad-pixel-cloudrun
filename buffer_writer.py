@@ -195,8 +195,10 @@ class BufferWriter:
             self.write_thread.join(timeout=5)
 
         with self.buffer_lock:
-            if self.buffer:
-                logger.info("Flushing remaining %d rows...", len(self.buffer))
-                self._flush_buffer()
+            has_data = len(self.buffer) > 0
+
+        if has_data:
+            logger.info("Flushing remaining data...")
+            self._flush_buffer()
 
         logger.info("BufferWriter stopped")
