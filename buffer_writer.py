@@ -77,8 +77,9 @@ class BufferWriter:
         try:
             self._write_to_parquet(data_to_write)
 
-            self.total_written += len(data_to_write)
-            self.last_write = datetime.utcnow().isoformat()
+            with self.buffer_lock:
+                self.total_written += len(data_to_write)
+                self.last_write = datetime.utcnow().isoformat()
 
             logger.info("Successfully wrote %d records to Parquet", len(data_to_write))
         except Exception as e:
