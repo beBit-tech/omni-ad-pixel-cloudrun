@@ -181,7 +181,7 @@ class BufferWriter:
 
     def _signal_handler(self, signum, frame):
         logger.warning(f"Received signal {signum}, initiating shutdown...")
-        self.stop()
+        gevent.spawn(self.stop)
 
     def start(self):
         if self.write_greenlet is None or self.write_greenlet.dead:
