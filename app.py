@@ -78,7 +78,6 @@ def track_pixel():
             return make_pixel_response()
 
         redirect_url = validate_redirect_url(to) if to else None
-        print("redirect_url:", redirect_url)
         mapping_id = request.cookies.get(COOKIE_NAME)
         is_created = False
 
