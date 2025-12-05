@@ -8,13 +8,11 @@ services:
       - "8070:8070"
   
     environment:
-      - DEBUG=true
-      - ENVIRONMENT=development
+      - DEBUG=${DEBUG:-false}
       - GCS_BUCKET=${GCS_BUCKET}
       - GCS_PROJECT=${GCS_PROJECT}
-      - COOKIE_DOMAIN=${COOKIE_DOMAIN}
       - SECRET_KEY=${SECRET_KEY}
-      - WORKERS=${WORKERS:-4}
+      - PORT=${PORT:-8070}
     command: python3 app.py
     volumes:
       - .:/app
