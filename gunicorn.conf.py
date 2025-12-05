@@ -4,5 +4,5 @@ worker_connections = 1000
 timeout = 30
 keepalive = 5
 loglevel = "info"
-accesslog = "-"
+accesslog = None
 errorlog = "-"
