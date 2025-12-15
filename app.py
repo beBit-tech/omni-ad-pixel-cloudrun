@@ -9,6 +9,7 @@ from flask import Flask, make_response, redirect, request
 
 from buffer_writer import BufferWriter
 
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
@@ -38,12 +39,11 @@ buffer_writer.start()
 
 
 PIXEL_GIF = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
-ALLOWED_REDIRECT_HOSTS = [
-    "onead.onevision.com.tw",
-    "localhost",
-    "omnisegment.com",
-    "omniscientai.com",
-]
+
+ALLOWED_REDIRECT_HOSTS = {
+    "onead.onevision.com.tw": "OneAD",
+    "localhost": "test",
+}
 
 
 def make_pixel_response():
@@ -54,31 +54,45 @@ def make_pixel_response():
     return response
 
 
-def is_allowed_hostname(hostname, allowed_hosts):
-    return any(hostname == host or hostname.endswith(f".{host}") for host in allowed_hosts)
-
-
 def validate_redirect_url(url):
     from urllib.parse import unquote, urlparse
 
     decoded = unquote(url)
     parsed = urlparse(decoded)
 
-    if parsed.scheme not in ["http", "https"]:
-        logger.warning("Invalid scheme: %s", parsed.scheme)
-        return None
-    if not parsed.hostname:
-        logger.warning("No hostname found")
-        return None
+    if parsed.scheme not in ["http", "https"] or not parsed.hostname:
+        return None, None
 
-    if not any(
-        parsed.hostname == host or parsed.hostname.endswith(f".{host}")
-        for host in ALLOWED_REDIRECT_HOSTS
-    ):
-        logger.warning("Hostname not allowed: %s", parsed.hostname)
-        return None
+    if parsed.hostname in ALLOWED_REDIRECT_HOSTS:
+        return decoded, ALLOWED_REDIRECT_HOSTS[parsed.hostname]
 
-    return decoded
+    logger.warning("Hostname not allowed: %s", parsed.hostname)
+    return None, None
+
+
+def get_or_create_mapping_id():
+    mapping_id = request.cookies.get(COOKIE_NAME)
+    if mapping_id:
+        return mapping_id, False
+    return str(uuid.uuid4()), True
+
+
+def add_mapping_id_to_url(url, mapping_id):
+    from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+    parsed = urlparse(url)
+    query_params = parse_qs(parsed.query)
+    query_params["id"] = [mapping_id]
+    new_query = urlencode(query_params, doseq=True)
+    return urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment)
+    )
+
+
+def make_redirect_response(url):
+    response = make_response(redirect(url, code=302))
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return response
 
 
 @app.route("/track", methods=["GET"])
@@ -86,20 +100,19 @@ def track_pixel():
     try:
         cid = request.args.get("cid")
         to = request.args.get("to")
+        partner = request.args.get("partner")
 
         if not cid:
             return make_pixel_response()
 
-        redirect_url = validate_redirect_url(to) if to else None
-        mapping_id = request.cookies.get(COOKIE_NAME)
-        is_created = False
+        valid_redirect_url, domain_partner = validate_redirect_url(to) if to else (None, None)
+        final_partner = partner or domain_partner or "unknown"
 
-        if not mapping_id:
-            mapping_id = str(uuid.uuid4())
-            is_created = True
+        mapping_id, is_new = get_or_create_mapping_id()
 
         buffer_writer.add(
             {
+                "partner": final_partner,
                 "cid": cid,
                 "mapping_id": mapping_id,
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -112,37 +125,21 @@ def track_pixel():
             }
         )
 
-        if redirect_url:
-            from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
-
-            parsed = urlparse(redirect_url)
-            query_params = parse_qs(parsed.query)
-            query_params["id"] = [mapping_id]
-            new_query = urlencode(query_params, doseq=True)
-            redirect_url = urlunparse(
-                (
-                    parsed.scheme,
-                    parsed.netloc,
-                    parsed.path,
-                    parsed.params,
-                    new_query,
-                    parsed.fragment,
-                )
-            )
-            response = make_response(redirect(redirect_url, code=302))
-            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        if valid_redirect_url:
+            url_with_mapping_id = add_mapping_id_to_url(valid_redirect_url, mapping_id)
+            response = make_redirect_response(url_with_mapping_id)
         else:
             response = make_pixel_response()
 
-        if is_created:
-            cookie_kwargs = {
-                "max_age": COOKIE_MAX_AGE,
-                "httponly": True,
-                "secure": True,
-                "samesite": "None",
-            }
-
-            response.set_cookie(COOKIE_NAME, mapping_id, **cookie_kwargs)
+        if is_new:
+            response.set_cookie(
+                COOKIE_NAME,
+                mapping_id,
+                max_age=COOKIE_MAX_AGE,
+                httponly=True,
+                secure=True,
+                samesite="None",
+            )
 
         return response
 
