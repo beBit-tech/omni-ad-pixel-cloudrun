@@ -95,6 +95,11 @@ def make_redirect_response(url):
     return response
 
 
+@app.route("/", methods=["GET"])
+def health_check():
+    return {"status": "ok", "service": "omni-ad-pixel"}, 200
+
+
 @app.route("/track", methods=["GET"])
 def track_pixel():
     try:
