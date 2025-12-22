@@ -1,5 +1,4 @@
 import base64
-import json
 import logging
 import os
 import uuid
@@ -107,34 +106,19 @@ def track_pixel():
         to = request.args.get("to")
         partner = request.args.get("partner")
 
-        if not cid:
-            return make_pixel_response()
+        response = make_pixel_response()
 
-        valid_redirect_url, domain_partner = validate_redirect_url(to) if to else (None, None)
-        final_partner = partner or domain_partner or "unknown"
+        if not cid:
+            return response
 
         mapping_id, is_new = get_or_create_mapping_id()
 
-        buffer_writer.add(
-            {
-                "partner": final_partner,
-                "cid": cid,
-                "mapping_id": mapping_id,
-                "timestamp": datetime.now(UTC).isoformat(),
-                "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr),
-                "user_agent": request.headers.get("User-Agent", ""),
-                "referer": request.headers.get("Referer", ""),
-                "date": datetime.now(UTC).strftime("%Y-%m-%d"),
-                "origin": request.headers.get("Origin", ""),
-                "headers": json.dumps(dict(request.headers)),
-            }
-        )
-
-        if valid_redirect_url:
-            url_with_mapping_id = add_mapping_id_to_url(valid_redirect_url, mapping_id)
-            response = make_redirect_response(url_with_mapping_id)
-        else:
-            response = make_pixel_response()
+        # Persist data only after confirming that the mapping_id cookie can be
+        # successfully read on a subsequent request. This avoids writing orphaned
+        # or useless mapping_ids to Parquet when third-party cookies are blocked.
+        #
+        # 1st visit (is_new=True): Cookie is set, but the client may block third-party cookies.
+        # 2nd visit (is_new=False): Cookie is confirmed to be readable by the server.
 
         if is_new:
             response.set_cookie(
@@ -144,6 +128,27 @@ def track_pixel():
                 httponly=True,
                 secure=True,
                 samesite="None",
+            )
+        else:
+            valid_redirect_url, domain_partner = validate_redirect_url(to) if to else (None, None)
+            final_partner = partner or domain_partner or "unknown"
+
+            if valid_redirect_url:
+                url_with_mapping_id = add_mapping_id_to_url(valid_redirect_url, mapping_id)
+                response = make_redirect_response(url_with_mapping_id)
+
+            buffer_writer.add(
+                {
+                    "partner": final_partner,
+                    "cid": cid,
+                    "mapping_id": mapping_id,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "ip_address": request.headers.get("X-Forwarded-For", request.remote_addr),
+                    "user_agent": request.headers.get("User-Agent", ""),
+                    "referer": request.headers.get("Referer", ""),
+                    "date": datetime.now(UTC).strftime("%Y-%m-%d"),
+                    "origin": request.headers.get("Origin", ""),
+                }
             )
 
         return response
