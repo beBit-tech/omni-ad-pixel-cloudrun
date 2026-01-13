@@ -40,13 +40,12 @@ import polars as pl
 from gcs_cache_helper import get_cache_dir, read_parquet_with_cache
 from google.cloud import storage
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
 # 固定配置
-CSV_FILE_PATH = "audience_service_mapping-01-06.csv"
+CSV_FILE_PATH = "audience_service_mapping.csv"
 GCS_BUCKET = "daily-pixel-data-consolidated"
 GCS_PROJECT = "bebit-tech-website"
 
@@ -385,7 +384,14 @@ def match_phone_to_onead(phone_data, parquet_data):
         f"匹配完成: 有 service_id 的 phone_hash {has_service_count:,}, 找到 mapping_id {mapping_matched_count:,}, 找到 OneAD cid {matched_count:,}"
     )
 
-    return results, matched_count, unmatched_count, mapping_matched_count, mapping_unmatched_count, has_service_count
+    return (
+        results,
+        matched_count,
+        unmatched_count,
+        mapping_matched_count,
+        mapping_unmatched_count,
+        has_service_count,
+    )
 
 
 def write_results_to_csv(results, output_path):
@@ -472,9 +478,7 @@ def print_summary(
 
     # 顯示 mapping_id 統計
     if mapping_matched_count is not None and mapping_unmatched_count is not None:
-        mapping_matched_pct = (
-            (mapping_matched_count / base_count * 100) if base_count > 0 else 0
-        )
+        mapping_matched_pct = (mapping_matched_count / base_count * 100) if base_count > 0 else 0
         mapping_unmatched_pct = (
             (mapping_unmatched_count / base_count * 100) if base_count > 0 else 0
         )
