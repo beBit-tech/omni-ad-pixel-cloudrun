@@ -18,6 +18,7 @@
 | 參數        | 必填 | 說明                                  | 範例值          |
 | :-------- | :--- | :---------------------------------- | :----------- |
 | `cid`     | 必填* | 客戶/用戶 ID (Client ID)，系統中唯一識別用戶的 ID。 | `user_12345` |
+| `partner` | 必填＊ | 合作夥伴識別碼，用於區分資料來源。| `OneAD`, `os` |
 | `to`      | 選填 | 重定向 URL，設置 cookie 後將用戶重定向到此 URL。 | `https://onead.onevision.com.tw/v2/pixel/os` |
 
 
@@ -35,7 +36,8 @@
 
 ```javascript
 const cid = 'user_12345';
-const url = `https://pixel.omnisegment.com/track?cid=${cid}`;
+const partner = 'OneAD'
+const url = `https://pixel.omnisegment.com/track?cid=${cid}&partner=${partner}`;
 
 const img = new Image();
 img.src = url;
@@ -89,7 +91,8 @@ https://pixel.omnisegment.com/track?cid=user123&to=https://onead.onevision.com.t
 
 ```javascript
 const cid = 'user_12345';
-const url = `https://pixel.omnisegment.com/track?cid=${cid}`;
+const partner = 'os';
+const url = `https://pixel.omnisegment.com/track?cid=${cid}&partner=${partner}`;
 
 fetch(url, {
   credentials: "include",
@@ -105,8 +108,9 @@ fetch(url, {
 
 ```javascript
 const cid = 'user_12345';
+const partner = 'OneAD';
 const redirectUrl = encodeURIComponent('https://onead.onevision.com.tw/v2/pixel/os');
-const url = `https://pixel.omnisegment.com/track?cid=${cid}&to=${redirectUrl}`;
+const url = `https://pixel.omnisegment.com/track?cid=${cid}&partner=${partner}&to=${redirectUrl}`;
 
 fetch(url, {
   credentials: "include",
