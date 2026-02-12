@@ -162,8 +162,8 @@ def load_parquet_data_from_gcs(
 
     Returns:
         dict: {
-            'os_cid_to_mappings': {cid: set(mapping_ids)} for partner=os,
-            'mapping_to_onead_cids': {mapping_id: set(cids)} for partner=OneAD,
+            'df_os': DataFrame with columns [cid, mapping_id] for partner=os,
+            'df_onead': DataFrame with columns [mapping_id, cid] for partner=OneAD,
             'date_range': {'start': start_date, 'end': end_date}
         }
     """
@@ -208,39 +208,43 @@ def load_parquet_data_from_gcs(
         logger.warning("未找到任何檔案")
         return None
 
-    # 用於存儲映射關係
-    os_cid_to_mappings = defaultdict(set)  # OS: cid -> set(mapping_ids)
-    mapping_to_onead_cids = defaultdict(set)  # OneAD: mapping_id -> set(cids)
+    # 階段1: 收集所有數據到 DataFrame 列表
+    logger.info("階段1: 讀取所有檔案...")
+    os_dataframes = []
+    onead_dataframes = []
     total_records = 0
     successful_files = 0
     failed_files = 0
+    local_cache_count = 0
+    gcs_download_count = 0
 
-    # 逐個日期讀取
     for i, date in enumerate(date_list):
         current_file_num = i + 1
         file_path = f"date={date}.parquet"
 
         try:
+            # 每處理 10 個檔案顯示一次進度
             if current_file_num % 10 == 0 or current_file_num == len(date_list):
-                logger.info(f"處理進度: {current_file_num}/{len(date_list)}")
+                logger.info(f"讀取進度: {current_file_num}/{len(date_list)}")
 
             # 使用本地快取讀取檔案
-            df = read_parquet_with_cache(
+            df, source = read_parquet_with_cache(
                 bucket_name=bucket_name,
                 file_path=file_path,
                 project_name=project_name,
                 force_download=force_download,
-                verbose=False,  # 不顯示每個檔案的詳細日誌
+                verbose=False,
+                return_source=True,
             )
 
             if df is None:
-                logger.warning(f"讀取檔案失敗，跳過: {file_path}")
                 failed_files += 1
                 continue
 
-            total_records += len(df)
+            file_record_count = len(df)
+            total_records += file_record_count
 
-            # 處理 partner 欄位（確保有值）
+            # 處理 partner 欄位
             if "partner" not in df.columns:
                 df = df.with_columns(pl.lit("OneAD").alias("partner"))
             else:
@@ -253,43 +257,87 @@ def load_parquet_data_from_gcs(
 
             # 確保有必要的欄位
             if "mapping_id" not in df.columns or "cid" not in df.columns:
-                logger.warning(f"檔案 {file_path} 缺少必要欄位，跳過")
                 failed_files += 1
                 continue
 
-            # 分別處理 OS 和 OneAD 數據
-            # OS: 建立 cid -> mapping_ids 映射
-            df_os = df.filter(pl.col("partner") == "os")
-            if len(df_os) > 0:
-                os_pairs = df_os.select(["cid", "mapping_id"]).unique()
-                for row in os_pairs.iter_rows():
-                    cid, mapping_id = row
-                    if cid and mapping_id:
-                        os_cid_to_mappings[cid].add(mapping_id)
+            # 分離 OS 和 OneAD 數據，只保留需要的欄位
+            df_os = df.filter(pl.col("partner") == "os").select(["cid", "mapping_id"])
+            df_onead = df.filter(pl.col("partner") == "OneAD").select(["mapping_id", "cid"])
 
-            # OneAD: 建立 mapping_id -> cids 映射
-            df_onead = df.filter(pl.col("partner") == "OneAD")
-            if len(df_onead) > 0:
-                onead_pairs = df_onead.select(["mapping_id", "cid"]).unique()
-                for row in onead_pairs.iter_rows():
-                    mapping_id, cid = row
-                    if mapping_id and cid:
-                        mapping_to_onead_cids[mapping_id].add(cid)
+            os_count = len(df_os)
+            onead_count = len(df_onead)
+
+            if os_count > 0:
+                os_dataframes.append(df_os)
+            if onead_count > 0:
+                onead_dataframes.append(df_onead)
+
+            # 更新統計
+            if source == "local":
+                local_cache_count += 1
+            else:
+                gcs_download_count += 1
 
             successful_files += 1
+
+            # 顯示處理結果（簡化版）
+            if current_file_num % 10 == 0 or current_file_num == len(date_list):
+                source_label = "[本地快取]" if source == "local" else "[GCS下載]"
+                logger.info(
+                    f"✓ {source_label} {date}: {file_record_count:,} 記錄 | "
+                    f"OS: {os_count:,} | OneAD: {onead_count:,}"
+                )
 
             # 釋放記憶體
             del df
 
         except Exception as e:
-            logger.error(f"讀取檔案失敗: {file_path}, 錯誤: {e}")
+            logger.error(f"處理檔案失敗: {file_path}, 錯誤: {e}")
             failed_files += 1
             continue
 
-    logger.info(f"成功處理 {successful_files} 個檔案，失敗 {failed_files} 個")
-    logger.info(f"總共處理 {total_records:,} 條記錄")
-    logger.info(f"OS 唯一 cid 數: {len(os_cid_to_mappings):,}")
-    logger.info(f"OneAD 唯一 mapping_id 數: {len(mapping_to_onead_cids):,}")
+    logger.info(f"成功讀取 {successful_files} 個檔案，失敗 {failed_files} 個")
+    logger.info(f"  └─ 本地快取: {local_cache_count} 個 | GCS 下載: {gcs_download_count} 個")
+    logger.info(f"總共 {total_records:,} 條記錄")
+
+    if not os_dataframes and not onead_dataframes:
+        logger.warning("沒有有效數據")
+        return None
+
+    # 階段2: 合併並去重數據（純 Polars 操作，不轉換為字典）
+    logger.info("階段2: 合併並去重數據...")
+
+    df_os = None
+    if os_dataframes:
+        logger.info(f"  合併 {len(os_dataframes)} 個 OS DataFrame...")
+        df_os_all = pl.concat(os_dataframes, how="vertical")
+        del os_dataframes  # 釋放記憶體
+
+        logger.info(f"  去重 OS 數據（{len(df_os_all):,} 條）...")
+        # 只去重，不聚合，保持為 DataFrame
+        df_os = (
+            df_os_all
+            .unique()
+            .filter(pl.col("cid").is_not_null() & pl.col("mapping_id").is_not_null())
+        )
+        del df_os_all
+        logger.info(f"  ✓ OS 唯一記錄數: {len(df_os):,}")
+
+    df_onead = None
+    if onead_dataframes:
+        logger.info(f"  合併 {len(onead_dataframes)} 個 OneAD DataFrame...")
+        df_onead_all = pl.concat(onead_dataframes, how="vertical")
+        del onead_dataframes  # 釋放記憶體
+
+        logger.info(f"  去重 OneAD 數據（{len(df_onead_all):,} 條）...")
+        # 只去重，不聚合，保持為 DataFrame
+        df_onead = (
+            df_onead_all
+            .unique()
+            .filter(pl.col("mapping_id").is_not_null() & pl.col("cid").is_not_null())
+        )
+        del df_onead_all
+        logger.info(f"  ✓ OneAD 唯一記錄數: {len(df_onead):,}")
 
     if successful_files == 0:
         logger.warning("沒有成功讀取任何檔案")
@@ -300,88 +348,138 @@ def load_parquet_data_from_gcs(
     actual_end_date = max(date_list) if date_list else None
 
     return {
-        "os_cid_to_mappings": dict(os_cid_to_mappings),
-        "mapping_to_onead_cids": dict(mapping_to_onead_cids),
+        "df_os": df_os,
+        "df_onead": df_onead,
         "date_range": {"start": actual_start_date, "end": actual_end_date, "days": len(date_list)},
     }
 
 
 def match_phone_to_onead(phone_data, parquet_data):
-    """匹配 phone_hash 到 OneAD cid
+    """匹配 phone_hash 到 OneAD cid（純 Polars 方案）
 
     Args:
         phone_data: CSV 數據（按 phone_hash 分組）
-        parquet_data: Parquet 數據映射
+        parquet_data: Parquet 數據（包含 DataFrames）
 
     Returns:
         tuple: (results, matched_count, unmatched_count, mapping_matched_count,
                 mapping_unmatched_count, has_service_count)
     """
-    logger.info("開始匹配數據...")
+    logger.info("開始匹配數據（純 Polars 方案）...")
 
-    os_cid_to_mappings = parquet_data["os_cid_to_mappings"]
-    mapping_to_onead_cids = parquet_data["mapping_to_onead_cids"]
+    df_os = parquet_data["df_os"]
+    df_onead = parquet_data["df_onead"]
 
-    results = []
-    matched_count = 0
-    unmatched_count = 0
-    mapping_matched_count = 0
-    mapping_unmatched_count = 0
-    has_service_count = 0  # 有 service_id 的 phone_hash 數量
-
+    # 準備 CSV 數據為 DataFrame
+    csv_rows = []
     for phone_hash, data in phone_data.items():
         org_abbrs = sorted(data["org_abbrs"])
         audience_ids = sorted(data["audience_ids"])
         service_ids = sorted(data["service_ids"])
 
-        # 只統計有 service_id 的記錄
         if not service_ids:
             continue
 
-        has_service_count += 1
+        csv_rows.append({
+            "phone_hash": phone_hash,
+            "org_abbr": ";".join(org_abbrs) if org_abbrs else "",
+            "audience_ids": ";".join(audience_ids) if audience_ids else "",
+            "service_ids": service_ids,  # 保留為列表
+        })
 
-        # 步驟1: 找出該 phone_hash 的所有 service_id 對應的 mapping_ids
-        all_mapping_ids = set()
-        for service_id in service_ids:
-            mapping_ids = os_cid_to_mappings.get(service_id, set())
-            all_mapping_ids.update(mapping_ids)
+    if not csv_rows:
+        logger.warning("沒有有效的 service_id 數據")
+        return ([], 0, 0, 0, 0, 0)
 
-        # 步驟2: 用這些 mapping_ids 找 OneAD 的 cids
-        onead_cids = set()
-        for mapping_id in all_mapping_ids:
-            cids = mapping_to_onead_cids.get(mapping_id, set())
-            onead_cids.update(cids)
+    logger.info(f"  準備匹配 {len(csv_rows):,} 個 phone_hash...")
+    df_csv = pl.DataFrame(csv_rows)
 
-        # 統計 mapping_id
-        has_mapping_id = len(all_mapping_ids) > 0
-        if has_mapping_id:
-            mapping_matched_count += 1
-        else:
-            mapping_unmatched_count += 1
+    # 展開 service_ids 列表
+    df_csv_exploded = df_csv.explode("service_ids").rename({"service_ids": "cid"})
 
-        # 統計 OneAD cid
-        has_onead_cid = len(onead_cids) > 0
-        if has_onead_cid:
-            matched_count += 1
-        else:
-            unmatched_count += 1
+    # Step 1: Join with OS data to get mapping_ids
+    logger.info("  步驟1: 匹配 service_id -> mapping_id...")
+    df_with_mapping = df_csv_exploded.join(
+        df_os,
+        on="cid",
+        how="left"
+    )
 
-        results.append(
-            {
-                "phone_hash": phone_hash,
-                "org_abbr": ";".join(org_abbrs) if org_abbrs else "",
-                "audience_ids": ";".join(audience_ids) if audience_ids else "",
-                "os_service_ids": ";".join(service_ids) if service_ids else "",
-                "mapping_ids": ";".join(sorted(all_mapping_ids)) if all_mapping_ids else "",
-                "mapping_id_count": len(all_mapping_ids),
-                "onead_cids": ";".join(sorted(onead_cids)) if onead_cids else "",
-                "has_onead_cid": "TRUE" if has_onead_cid else "FALSE",
-                "onead_cid_count": len(onead_cids),
-            }
-        )
+    # Step 2: Join with OneAD data to get onead_cids
+    logger.info("  步驟2: 匹配 mapping_id -> onead_cid...")
+    df_with_onead = df_with_mapping.join(
+        df_onead.rename({"cid": "onead_cid"}),
+        on="mapping_id",
+        how="left"
+    )
+
+    # Step 3: 按 phone_hash 聚合結果
+    logger.info("  步驟3: 聚合結果...")
+    df_result = (
+        df_with_onead
+        .group_by(["phone_hash", "org_abbr", "audience_ids"])
+        .agg([
+            pl.col("cid").unique().alias("os_service_ids"),
+            pl.col("mapping_id").unique().drop_nulls().alias("mapping_ids"),
+            pl.col("onead_cid").unique().drop_nulls().alias("onead_cids"),
+        ])
+        .with_columns([
+            pl.col("os_service_ids").list.len().alias("service_id_count"),
+            pl.col("mapping_ids").list.len().alias("mapping_id_count"),
+            pl.col("onead_cids").list.len().alias("onead_cid_count"),
+            (pl.col("onead_cids").list.len() > 0).alias("has_onead_cid"),
+        ])
+    )
+
+    # 轉換為結果格式（使用 Polars 操作，避免慢速的 iter_rows）
+    logger.info("  轉換為輸出格式...")
+
+    # 在 Polars 中完成字串轉換
+    df_output = df_result.with_columns([
+        pl.col("os_service_ids").list.sort().list.join(";").alias("os_service_ids_str"),
+        pl.col("mapping_ids").list.sort().list.join(";").alias("mapping_ids_str"),
+        pl.col("onead_cids").list.sort().list.join(";").alias("onead_cids_str"),
+        pl.when(pl.col("has_onead_cid")).then(pl.lit("TRUE")).otherwise(pl.lit("FALSE")).alias("has_onead_cid_str"),
+    ])
+
+    # 使用 to_dict() 比 iter_rows() 快很多
+    result_dict = df_output.to_dict(as_series=False)
+
+    results = []
+    for i in range(len(result_dict["phone_hash"])):
+        results.append({
+            "phone_hash": result_dict["phone_hash"][i],
+            "org_abbr": result_dict["org_abbr"][i],
+            "audience_ids": result_dict["audience_ids"][i],
+            "os_service_ids": result_dict["os_service_ids_str"][i],
+            "mapping_ids": result_dict["mapping_ids_str"][i] or "",
+            "mapping_id_count": result_dict["mapping_id_count"][i],
+            "onead_cids": result_dict["onead_cids_str"][i] or "",
+            "has_onead_cid": result_dict["has_onead_cid_str"][i],
+            "onead_cid_count": result_dict["onead_cid_count"][i],
+        })
+
+    # 統計（使用 Polars 聚合，比 Python 循環快）
+    has_service_count = len(results)
+    mapping_matched_count = df_result.filter(pl.col("mapping_id_count") > 0).height
+    mapping_unmatched_count = has_service_count - mapping_matched_count
+    matched_count = df_result.filter(pl.col("has_onead_cid")).height
+    unmatched_count = has_service_count - matched_count
+
+    # 提取所有唯一的 OneAD CIDs
+    logger.info("  提取唯一的 OneAD CIDs...")
+    unique_onead_cids = (
+        df_result
+        .select(pl.col("onead_cids").explode().unique().drop_nulls())
+        .to_series()
+        .sort()
+        .to_list()
+    )
 
     logger.info(
-        f"匹配完成: 有 service_id 的 phone_hash {has_service_count:,}, 找到 mapping_id {mapping_matched_count:,}, 找到 OneAD cid {matched_count:,}"
+        f"匹配完成: 有 service_id 的 phone_hash {has_service_count:,}, "
+        f"找到 mapping_id {mapping_matched_count:,}, 找到 OneAD cid {matched_count:,}, "
+        f"唯一 OneAD CID 數: {len(unique_onead_cids):,}"
     )
 
     return (
@@ -391,6 +489,7 @@ def match_phone_to_onead(phone_data, parquet_data):
         mapping_matched_count,
         mapping_unmatched_count,
         has_service_count,
+        unique_onead_cids,
     )
 
 
@@ -425,6 +524,29 @@ def write_results_to_csv(results, output_path):
 
     except Exception as e:
         logger.error(f"寫入 CSV 失敗: {e}")
+        sys.exit(1)
+
+
+def write_unique_cids_to_csv(unique_cids, output_path):
+    """寫入唯一的 OneAD CIDs 到 CSV
+
+    Args:
+        unique_cids: 唯一 CID 列表
+        output_path: 輸出文件路徑
+    """
+    logger.info(f"寫入唯一 OneAD CIDs 到: {output_path}")
+
+    try:
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["onead_cids"])  # 寫入標題
+            for cid in unique_cids:
+                writer.writerow([cid])
+
+        logger.info(f"✓ 成功寫入 {len(unique_cids):,} 個唯一 CID")
+
+    except Exception as e:
+        logger.error(f"寫入唯一 CID CSV 失敗: {e}")
         sys.exit(1)
 
 
@@ -542,6 +664,7 @@ def main():
         mapping_matched_count,
         mapping_unmatched_count,
         has_service_count,
+        unique_onead_cids,
     ) = match_phone_to_onead(phone_data, parquet_data)
 
     # 步驟4: 寫入 CSV
@@ -551,8 +674,13 @@ def main():
     elif start_date:
         date_suffix = f"_{start_date}"
 
+    # 寫入匹配結果
     output_path = f"service_to_onead_mapping{date_suffix}.csv"
     write_results_to_csv(results, output_path)
+
+    # 寫入唯一的 OneAD CIDs
+    unique_cids_path = f"unique_onead_cids{date_suffix}.csv"
+    write_unique_cids_to_csv(unique_onead_cids, unique_cids_path)
 
     # 步驟5: 打印統計（包含日期範圍）
     date_range = parquet_data.get("date_range")

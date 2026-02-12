@@ -163,7 +163,8 @@ def read_parquet_with_cache(
     file_path,
     project_name,
     force_download=False,
-    verbose=True
+    verbose=True,
+    return_source=False
 ):
     """下載並讀取 Parquet 檔案（使用本地快取）
 
@@ -175,11 +176,19 @@ def read_parquet_with_cache(
         project_name: GCP 專案名稱
         force_download: 是否強制重新下載
         verbose: 是否顯示詳細日誌
+        return_source: 是否返回來源資訊（預設 False）
 
     Returns:
-        polars.DataFrame: 讀取的 DataFrame，如果失敗返回 None
+        如果 return_source=False: polars.DataFrame 或 None
+        如果 return_source=True: (polars.DataFrame, str) 或 (None, None)
+            其中 str 為 'local' 或 'gcs'
     """
     import polars as pl
+
+    # 檢查是否從本地快取讀取
+    local_path = get_local_cache_path(bucket_name, file_path)
+    is_from_cache = local_path.exists() and not force_download
+    source = 'local' if is_from_cache else 'gcs'
 
     local_path = download_parquet_with_cache(
         bucket_name=bucket_name,
@@ -190,13 +199,19 @@ def read_parquet_with_cache(
     )
 
     if local_path is None:
+        if return_source:
+            return None, None
         return None
 
     try:
         df = pl.read_parquet(local_path)
+        if return_source:
+            return df, source
         return df
     except Exception as e:
         logger.error(f"讀取 Parquet 失敗: {local_path}, 錯誤: {e}")
+        if return_source:
+            return None, None
         return None
 
 
