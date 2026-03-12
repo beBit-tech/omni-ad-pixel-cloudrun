@@ -31,6 +31,7 @@
 
 import argparse
 import csv
+import gc
 import logging
 import sys
 from collections import defaultdict
@@ -208,10 +209,14 @@ def load_parquet_data_from_gcs(
         logger.warning("未找到任何檔案")
         return None
 
-    # 階段1: 收集所有數據到 DataFrame 列表
-    logger.info("階段1: 讀取所有檔案...")
-    os_dataframes = []
-    onead_dataframes = []
+    # 優化的讀取策略：延後去重到最後一步
+    logger.info("開始讀取數據（優化版）...")
+
+    # 臨時批次列表
+    os_batch = []
+    onead_batch = []
+    BATCH_SIZE = 10  # 批次大小（平衡去重效率和記憶體使用）
+
     total_records = 0
     successful_files = 0
     failed_files = 0
@@ -260,17 +265,25 @@ def load_parquet_data_from_gcs(
                 failed_files += 1
                 continue
 
-            # 分離 OS 和 OneAD 數據，只保留需要的欄位
-            df_os = df.filter(pl.col("partner") == "os").select(["cid", "mapping_id"])
-            df_onead = df.filter(pl.col("partner") == "OneAD").select(["mapping_id", "cid"])
+            # 只選取需要的欄位，過濾 null 值，並去重，減少記憶體使用
+            df = (
+                df.select(["partner", "cid", "mapping_id"])
+                .filter(pl.col("cid").is_not_null() & pl.col("mapping_id").is_not_null())
+                .unique()
+            )
 
-            os_count = len(df_os)
-            onead_count = len(df_onead)
+            # 分離 OS 和 OneAD 數據
+            df_os_new = df.filter(pl.col("partner") == "os").select(["cid", "mapping_id"])
+            df_onead_new = df.filter(pl.col("partner") == "OneAD").select(["mapping_id", "cid"])
 
+            os_count = len(df_os_new)
+            onead_count = len(df_onead_new)
+
+            # 加入批次
             if os_count > 0:
-                os_dataframes.append(df_os)
+                os_batch.append(df_os_new)
             if onead_count > 0:
-                onead_dataframes.append(df_onead)
+                onead_batch.append(df_onead_new)
 
             # 更新統計
             if source == "local":
@@ -289,55 +302,91 @@ def load_parquet_data_from_gcs(
                 )
 
             # 釋放記憶體
-            del df
+            del df, df_os_new, df_onead_new
+
+            # 每處理 BATCH_SIZE 個檔案時，合併批次並立即去重
+            if len(os_batch) >= BATCH_SIZE:
+                if os_batch:
+                    logger.info(f"  合併 OS 批次 (累積 {len(os_batch)} 個檔案)...")
+                    batch_merged = pl.concat(os_batch, how="vertical")
+                    before_count = len(batch_merged)
+                    logger.info(f"    合併前: {before_count:,} 記錄")
+                    del os_batch
+                    batch_merged = batch_merged.unique()
+                    after_count = len(batch_merged)
+                    logger.info(f"    去重後: {after_count:,} 記錄 (-{before_count - after_count:,}, {after_count/before_count*100:.1f}%) ✓")
+                    os_batch = [batch_merged]
+                    del batch_merged
+                    gc.collect()
+
+            if len(onead_batch) >= BATCH_SIZE:
+                if onead_batch:
+                    logger.info(f"  合併 OneAD 批次 (累積 {len(onead_batch)} 個檔案)...")
+                    batch_merged = pl.concat(onead_batch, how="vertical")
+                    before_count = len(batch_merged)
+                    logger.info(f"    合併前: {before_count:,} 記錄")
+                    del onead_batch
+                    batch_merged = batch_merged.unique()
+                    after_count = len(batch_merged)
+                    logger.info(f"    去重後: {after_count:,} 記錄 (-{before_count - after_count:,}, {after_count/before_count*100:.1f}%) ✓")
+                    onead_batch = [batch_merged]
+                    del batch_merged
+                    gc.collect()
 
         except Exception as e:
             logger.error(f"處理檔案失敗: {file_path}, 錯誤: {e}")
             failed_files += 1
             continue
 
+    # 最終合併並去重
+    logger.info("最終合併去重中...")
+    df_os = None
+    df_onead = None
+
+    if os_batch:
+        batch_count = len(os_batch)
+        logger.info(f"  處理 OS 最終批次 ({batch_count} 個批次)...")
+        if batch_count > 1:
+            df_os = pl.concat(os_batch, how="vertical")
+            before = len(df_os)
+            logger.info(f"    合併前: {before:,} 記錄")
+            del os_batch
+            gc.collect()
+            df_os = df_os.unique()
+            after = len(df_os)
+            logger.info(f"    去重後: {after:,} 記錄 (-{before - after:,})")
+        else:
+            df_os = os_batch[0]
+            del os_batch
+        logger.info(f"✓ OS 最終唯一記錄數: {len(df_os):,}")
+        gc.collect()
+
+    if onead_batch:
+        batch_count = len(onead_batch)
+        logger.info(f"  處理 OneAD 最終批次 ({batch_count} 個批次)...")
+        if batch_count > 1:
+            df_onead = pl.concat(onead_batch, how="vertical")
+            before = len(df_onead)
+            logger.info(f"    合併前: {before:,} 記錄")
+            del onead_batch
+            gc.collect()
+            logger.info("    執行去重操作...")
+            df_onead = df_onead.unique()
+            after = len(df_onead)
+            logger.info(f"    去重後: {after:,} 記錄 (-{before - after:,})")
+        else:
+            df_onead = onead_batch[0]
+            del onead_batch
+        logger.info(f"✓ OneAD 最終唯一記錄數: {len(df_onead):,}")
+        gc.collect()
+
     logger.info(f"成功讀取 {successful_files} 個檔案，失敗 {failed_files} 個")
     logger.info(f"  └─ 本地快取: {local_cache_count} 個 | GCS 下載: {gcs_download_count} 個")
     logger.info(f"總共 {total_records:,} 條記錄")
 
-    if not os_dataframes and not onead_dataframes:
+    if df_os is None and df_onead is None:
         logger.warning("沒有有效數據")
         return None
-
-    # 階段2: 合併並去重數據（純 Polars 操作，不轉換為字典）
-    logger.info("階段2: 合併並去重數據...")
-
-    df_os = None
-    if os_dataframes:
-        logger.info(f"  合併 {len(os_dataframes)} 個 OS DataFrame...")
-        df_os_all = pl.concat(os_dataframes, how="vertical")
-        del os_dataframes  # 釋放記憶體
-
-        logger.info(f"  去重 OS 數據（{len(df_os_all):,} 條）...")
-        # 只去重，不聚合，保持為 DataFrame
-        df_os = (
-            df_os_all
-            .unique()
-            .filter(pl.col("cid").is_not_null() & pl.col("mapping_id").is_not_null())
-        )
-        del df_os_all
-        logger.info(f"  ✓ OS 唯一記錄數: {len(df_os):,}")
-
-    df_onead = None
-    if onead_dataframes:
-        logger.info(f"  合併 {len(onead_dataframes)} 個 OneAD DataFrame...")
-        df_onead_all = pl.concat(onead_dataframes, how="vertical")
-        del onead_dataframes  # 釋放記憶體
-
-        logger.info(f"  去重 OneAD 數據（{len(df_onead_all):,} 條）...")
-        # 只去重，不聚合，保持為 DataFrame
-        df_onead = (
-            df_onead_all
-            .unique()
-            .filter(pl.col("mapping_id").is_not_null() & pl.col("cid").is_not_null())
-        )
-        del df_onead_all
-        logger.info(f"  ✓ OneAD 唯一記錄數: {len(df_onead):,}")
 
     if successful_files == 0:
         logger.warning("沒有成功讀取任何檔案")
@@ -397,18 +446,33 @@ def match_phone_to_onead(phone_data, parquet_data):
     # 展開 service_ids 列表
     df_csv_exploded = df_csv.explode("service_ids").rename({"service_ids": "cid"})
 
-    # Step 1: Join with OS data to get mapping_ids
+    # 優化：只保留需要的 cid，減少 join 資料量
+    needed_cids = df_csv_exploded.select("cid").unique()
+    logger.info(f"  需要匹配的唯一 service_id 數: {len(needed_cids):,}")
+
+    # Step 1: Join with OS data to get mapping_ids（優化版：semi join 過濾）
     logger.info("  步驟1: 匹配 service_id -> mapping_id...")
+    df_os_filtered = df_os.join(needed_cids, on="cid", how="semi")
+    logger.info(f"  過濾後的 OS 記錄數: {len(df_os_filtered):,}")
+
     df_with_mapping = df_csv_exploded.join(
-        df_os,
+        df_os_filtered,
         on="cid",
         how="left"
     )
 
-    # Step 2: Join with OneAD data to get onead_cids
+    # 優化：只保留有 mapping_id 的記錄來做第二次 join
+    df_with_mapping_valid = df_with_mapping.filter(pl.col("mapping_id").is_not_null())
+    needed_mapping_ids = df_with_mapping_valid.select("mapping_id").unique()
+    logger.info(f"  需要匹配的唯一 mapping_id 數: {len(needed_mapping_ids):,}")
+
+    # Step 2: Join with OneAD data to get onead_cids（優化版）
     logger.info("  步驟2: 匹配 mapping_id -> onead_cid...")
+    df_onead_filtered = df_onead.join(needed_mapping_ids, on="mapping_id", how="semi")
+    logger.info(f"  過濾後的 OneAD 記錄數: {len(df_onead_filtered):,}")
+
     df_with_onead = df_with_mapping.join(
-        df_onead.rename({"cid": "onead_cid"}),
+        df_onead_filtered.rename({"cid": "onead_cid"}),
         on="mapping_id",
         how="left"
     )
@@ -431,33 +495,29 @@ def match_phone_to_onead(phone_data, parquet_data):
         ])
     )
 
-    # 轉換為結果格式（使用 Polars 操作，避免慢速的 iter_rows）
+    # 轉換為結果格式（完全在 Polars 中處理）
     logger.info("  轉換為輸出格式...")
 
-    # 在 Polars 中完成字串轉換
+    # 在 Polars 中完成所有字串轉換和格式化
     df_output = df_result.with_columns([
-        pl.col("os_service_ids").list.sort().list.join(";").alias("os_service_ids_str"),
-        pl.col("mapping_ids").list.sort().list.join(";").alias("mapping_ids_str"),
-        pl.col("onead_cids").list.sort().list.join(";").alias("onead_cids_str"),
-        pl.when(pl.col("has_onead_cid")).then(pl.lit("TRUE")).otherwise(pl.lit("FALSE")).alias("has_onead_cid_str"),
+        pl.col("os_service_ids").list.sort().list.join(";").alias("os_service_ids"),
+        pl.col("mapping_ids").list.sort().list.join(";").fill_null("").alias("mapping_ids"),
+        pl.col("onead_cids").list.sort().list.join(";").fill_null("").alias("onead_cids"),
+        pl.when(pl.col("has_onead_cid")).then(pl.lit("TRUE")).otherwise(pl.lit("FALSE")).alias("has_onead_cid"),
+    ]).select([
+        "phone_hash",
+        "org_abbr",
+        "audience_ids",
+        "os_service_ids",
+        "mapping_ids",
+        "mapping_id_count",
+        "onead_cids",
+        "has_onead_cid",
+        "onead_cid_count",
     ])
 
-    # 使用 to_dict() 比 iter_rows() 快很多
-    result_dict = df_output.to_dict(as_series=False)
-
-    results = []
-    for i in range(len(result_dict["phone_hash"])):
-        results.append({
-            "phone_hash": result_dict["phone_hash"][i],
-            "org_abbr": result_dict["org_abbr"][i],
-            "audience_ids": result_dict["audience_ids"][i],
-            "os_service_ids": result_dict["os_service_ids_str"][i],
-            "mapping_ids": result_dict["mapping_ids_str"][i] or "",
-            "mapping_id_count": result_dict["mapping_id_count"][i],
-            "onead_cids": result_dict["onead_cids_str"][i] or "",
-            "has_onead_cid": result_dict["has_onead_cid_str"][i],
-            "onead_cid_count": result_dict["onead_cid_count"][i],
-        })
+    # 使用 to_dicts() 一次性轉換（比逐行處理快很多）
+    results = df_output.to_dicts()
 
     # 統計（使用 Polars 聚合，比 Python 循環快）
     has_service_count = len(results)

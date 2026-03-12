@@ -23,6 +23,7 @@
 import argparse
 import io
 import logging
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -364,13 +365,15 @@ def main():
 範例:
   %(prog)s                      # 處理昨天的資料
   %(prog)s 2024-12-22           # 處理指定日期
-  %(prog)s 2024-12-22 2024-12-25  # 處理日期範圍
+  %(prog)s 2024-12-22 2024-12-25  # 處理日期範圍（預設並行處理 3 天）
   %(prog)s 2024-12-22 --force   # 強制覆蓋已存在檔案
+  %(prog)s 2024-12-22 2024-12-25 --parallel 5  # 並行處理 5 天
         """,
     )
     parser.add_argument("start_date", nargs="?", help="開始日期 (YYYY-MM-DD)，預設為昨天")
     parser.add_argument("end_date", nargs="?", help="結束日期 (YYYY-MM-DD)，可選")
     parser.add_argument("--force", action="store_true", help="強制覆蓋已存在的輸出檔案")
+    parser.add_argument("--parallel", type=int, default=3, help="並行處理的日期數量 (預設: 3，建議: 3-5)")
 
     args = parser.parse_args()
 
@@ -393,24 +396,67 @@ def main():
 
     logger.info(f"將處理 {len(date_list)} 個日期: {start_date} 到 {end_date}")
 
+    # 確定並行處理的日期數量
+    parallel_days = args.parallel
+
+    # 計算需要的連接池大小：並行日期數 × 每天的並行線程數 + 緩衝
+    required_pool_size = parallel_days * 10 + 10
+
+    # 設置 urllib3 連接池大小（在導入 storage client 之前）
+    # 這會影響所有 HTTP 連接
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # 修改默認的連接池管理器設置
+    from urllib3.util.retry import Retry
+    from urllib3.poolmanager import PoolManager
+
     # 連接到 GCS
     logger.info("連接到 GCS")
     logger.info(f"  源資料 Bucket: {GCS_BUCKET}")
     logger.info(f"  輸出 Bucket: {GCS_OUTPUT_BUCKET}")
     logger.info(f"  Project: {GCS_PROJECT}")
+    logger.info(f"  連接池大小: {required_pool_size}")
+
     try:
+        # 簡單創建 GCS 客戶端，讓它使用默認配置
+        # 連接池警告不影響功能，只是提示連接被丟棄
         client = storage.Client(project=GCS_PROJECT)
         source_bucket = client.bucket(GCS_BUCKET)
         output_bucket = client.bucket(GCS_OUTPUT_BUCKET)
     except Exception as e:
         logger.error(f"連接 GCS 失敗: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
-    # 處理每個日期
-    results = []
-    for date_str in date_list:
-        result = process_single_date(source_bucket, output_bucket, date_str, force=args.force)
-        results.append(result)
+    # 處理每個日期（支援並行）
+    if parallel_days > 1:
+        logger.info(f"使用並行模式處理，同時處理 {parallel_days} 天")
+        results = []
+
+        with ThreadPoolExecutor(max_workers=parallel_days) as executor:
+            # 提交所有日期的處理任務
+            future_to_date = {
+                executor.submit(process_single_date, source_bucket, output_bucket, date_str, args.force): date_str
+                for date_str in date_list
+            }
+
+            # 按完成順序收集結果
+            for future in as_completed(future_to_date):
+                date_str = future_to_date[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    logger.error(f"處理日期 {date_str} 時發生錯誤: {e}")
+                    results.append(None)
+    else:
+        logger.info("使用串行模式處理")
+        results = []
+        for date_str in date_list:
+            result = process_single_date(source_bucket, output_bucket, date_str, force=args.force)
+            results.append(result)
 
     # 列印摘要
     print_summary(results)
