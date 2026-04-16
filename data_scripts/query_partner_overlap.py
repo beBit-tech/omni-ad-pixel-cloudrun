@@ -32,6 +32,7 @@
 """
 
 import argparse
+import gc
 import logging
 import sys
 from datetime import datetime, timedelta
@@ -61,12 +62,13 @@ def generate_date_range(start_date, end_date):
 
 
 def load_and_aggregate_from_gcs(bucket_name, project_name, start_date=None, end_date=None, force_download=False):
-    """從 GCS 載入 Parquet 檔案並進行串流聚合（節省記憶體，優先使用本地快取）
+    """從 GCS 載入 Parquet 檔案並進行批次聚合（優化版，使用 Polars 向量化操作）
 
     從 daily-pixel-data-consolidated bucket 讀取已整合的每日 parquet 檔案
-    不將所有資料載入記憶體，而是邊讀邊聚合，保存以下映射關係：
-    - mapping_id -> partners (用於找出跨來源的 mapping_id)
-    - mapping_id -> cid (用於將跨來源的 mapping_id 轉換為 cid)
+    使用批次處理和 Polars 向量化操作，大幅提升效能：
+    - 每 10 個檔案合併一次並去重
+    - 使用 Polars 的 group_by + agg 代替逐行迭代
+    - 定期執行 gc.collect() 釋放記憶體
 
     Args:
         bucket_name: GCS bucket 名稱
@@ -110,33 +112,33 @@ def load_and_aggregate_from_gcs(bucket_name, project_name, start_date=None, end_
         logger.warning("未找到任何檔案")
         return None
 
-    # 使用字典儲存聚合結果
-    # mapping_partners: mapping_id -> set(partners) (用於找交集)
-    # mapping_to_cid: mapping_id -> cid (用於轉換)
-    mapping_partners = {}
-    mapping_to_cid = {}
+    # 使用批次處理：收集 DataFrame 後批次合併
+    data_batch = []
+    BATCH_SIZE = 10  # 每 10 個檔案合併一次
+
     total_records = 0
     successful_files = 0
     failed_files = 0
+    local_cache_count = 0
+    gcs_download_count = 0
 
-    # 逐個日期讀取和聚合
+    # 逐個日期讀取和批次處理
     for i, date in enumerate(date_list):
         current_file_num = i + 1
         file_path = f"date={date}.parquet"
 
         try:
             if current_file_num % 10 == 0 or current_file_num == len(date_list):
-                logger.info(
-                    f"處理進度: {current_file_num}/{len(date_list)}, 當前唯一 mapping_id: {len(mapping_partners):,}"
-                )
+                logger.info(f"讀取進度: {current_file_num}/{len(date_list)}")
 
             # 使用本地快取讀取檔案
-            df = read_parquet_with_cache(
+            df, source = read_parquet_with_cache(
                 bucket_name=bucket_name,
                 file_path=file_path,
                 project_name=project_name,
                 force_download=force_download,
-                verbose=False  # 不顯示每個檔案的詳細日誌
+                verbose=False,  # 不顯示每個檔案的詳細日誌
+                return_source=True
             )
 
             if df is None:
@@ -144,14 +146,13 @@ def load_and_aggregate_from_gcs(bucket_name, project_name, start_date=None, end_
                 failed_files += 1
                 continue
 
-            total_records += len(df)
+            file_record_count = len(df)
+            total_records += file_record_count
 
             # 處理 partner 欄位
             if "partner" not in df.columns:
-                # 如果沒有 partner 欄位，所有記錄視為 OneAD
                 df = df.with_columns(pl.lit("OneAD").alias("partner"))
             else:
-                # 如果有 partner 欄位但值為空/null，填充為 OneAD
                 df = df.with_columns(
                     pl.when(pl.col("partner").is_null() | (pl.col("partner") == ""))
                     .then(pl.lit("OneAD"))
@@ -159,54 +160,118 @@ def load_and_aggregate_from_gcs(bucket_name, project_name, start_date=None, end_
                     .alias("partner")
                 )
 
-            # 提取 mapping_id, cid, partner，立即聚合
+            # 檢查必要欄位
             if "mapping_id" not in df.columns or "cid" not in df.columns:
                 logger.warning(f"檔案 {file_path} 缺少必要欄位 (mapping_id 或 cid)，跳過")
                 failed_files += 1
                 continue
 
-            unique_records = df.select(["mapping_id", "cid", "partner"]).unique()
+            # 只選取需要的欄位，過濾 null 值，並去重
+            df_clean = (
+                df.select(["mapping_id", "cid", "partner"])
+                .filter(pl.col("mapping_id").is_not_null() & pl.col("cid").is_not_null())
+                .unique()
+            )
 
-            # 更新聚合字典
-            for row in unique_records.iter_rows():
-                mapping_id, cid, partner = row
+            # 加入批次
+            if len(df_clean) > 0:
+                data_batch.append(df_clean)
 
-                # 更新 mapping_id -> partners
-                if mapping_id not in mapping_partners:
-                    mapping_partners[mapping_id] = set()
-                mapping_partners[mapping_id].add(partner)
-
-                # 更新 mapping_id -> cid (一個 mapping_id 只對應一個 cid)
-                mapping_to_cid[mapping_id] = cid
+            # 更新統計
+            if source == "local":
+                local_cache_count += 1
+            else:
+                gcs_download_count += 1
 
             successful_files += 1
 
-            # 立即釋放 DataFrame 記憶體
-            del df
+            # 釋放原始 DataFrame 記憶體
+            del df, df_clean
+
+            # 每處理 BATCH_SIZE 個檔案時，合併批次並立即去重
+            if len(data_batch) >= BATCH_SIZE:
+                logger.info(f"  合併批次 (累積 {len(data_batch)} 個檔案)...")
+                batch_merged = pl.concat(data_batch, how="vertical")
+                before_count = len(batch_merged)
+                del data_batch
+                batch_merged = batch_merged.unique()
+                after_count = len(batch_merged)
+                logger.info(f"    去重後: {after_count:,} 記錄 (-{before_count - after_count:,}) ✓")
+                data_batch = [batch_merged]
+                del batch_merged
+                gc.collect()
 
         except Exception as e:
             logger.error(f"讀取檔案失敗: {file_path}, 錯誤: {e}")
             failed_files += 1
             continue
 
+    # 最終合併所有批次
+    logger.info("最終合併去重中...")
+    df_all = None
+
+    if data_batch:
+        batch_count = len(data_batch)
+        logger.info(f"  處理最終批次 ({batch_count} 個批次)...")
+        if batch_count > 1:
+            df_all = pl.concat(data_batch, how="vertical")
+            before = len(df_all)
+            del data_batch
+            gc.collect()
+            logger.info(f"    合併前: {before:,} 記錄")
+            df_all = df_all.unique()
+            after = len(df_all)
+            logger.info(f"    去重後: {after:,} 記錄 (-{before - after:,})")
+        else:
+            df_all = data_batch[0]
+            del data_batch
+        gc.collect()
+
+    if df_all is None or len(df_all) == 0:
+        logger.warning("沒有有效數據")
+        return None
+
+    logger.info(f"✓ 最終唯一記錄數: {len(df_all):,}")
+
+    # 使用 Polars 向量化操作建立映射（比 iter_rows 快 10-100 倍）
+    logger.info("建立 mapping_id -> partners 映射...")
+
+    # 步驟1: 使用 group_by + agg 聚合 partners
+    df_partners = (
+        df_all
+        .group_by("mapping_id")
+        .agg([
+            pl.col("partner").unique().alias("partners"),
+            pl.col("cid").first().alias("cid")  # 一個 mapping_id 只對應一個 cid
+        ])
+    )
+
+    # 統計資訊
+    unique_cids = df_partners.select("cid").unique()
+
     logger.info(f"成功處理 {successful_files} 個檔案，失敗 {failed_files} 個")
+    logger.info(f"  └─ 本地快取: {local_cache_count} 個 | GCS 下載: {gcs_download_count} 個")
     logger.info(f"總共處理 {total_records:,} 條記錄")
-    logger.info(f"唯一 mapping_id 數: {len(mapping_partners):,}")
-    logger.info(f"唯一 cid 數: {len(set(mapping_to_cid.values())):,}")
+    logger.info(f"唯一 mapping_id 數: {len(df_partners):,}")
+    logger.info(f"唯一 cid 數: {len(unique_cids):,}")
 
     if successful_files == 0:
         logger.warning("沒有成功讀取任何檔案")
         return None
 
+    # 釋放不需要的 DataFrame
+    del df_all, unique_cids
+    gc.collect()
+
+    # 返回 Polars DataFrame 而非字典（快很多！）
     return {
-        "mapping_partners": mapping_partners,
-        "mapping_to_cid": mapping_to_cid,
+        "df_partners": df_partners,  # DataFrame with columns: mapping_id, partners (list), cid
         "total_records": total_records,
     }
 
 
-def analyze_partner_overlap(mapping_partners, mapping_to_cid):
-    """分析 partner 重疊情況
+def analyze_partner_overlap(df_partners):
+    """分析 partner 重疊情況（純 Polars 向量化版本）
 
     分析方法：
     1. 使用 mapping_id 識別跨來源的使用者（同時出現在 OneAD 和 OS）
@@ -214,84 +279,104 @@ def analyze_partner_overlap(mapping_partners, mapping_to_cid):
     3. 以各 partner 的總客戶數 (cid) 為分母計算重疊比例
 
     Args:
-        mapping_partners: dict，mapping_id -> set(partners) 的映射
-        mapping_to_cid: dict，mapping_id -> cid 的映射
+        df_partners: Polars DataFrame with columns [mapping_id, partners (list), cid]
 
     Returns:
         dict: 分析結果
     """
-    # 步驟1: 找出跨來源的 mapping_id
-    cross_mapping_ids = []
-    onead_mapping_ids = set()
-    os_mapping_ids = set()
+    logger.info("開始分析 partner 重疊情況（純 Polars 方案）...")
 
-    for mapping_id, partners in mapping_partners.items():
-        has_onead = "OneAD" in partners
-        has_os = "os" in partners
+    # 步驟1: 標記各 partner 類型（使用向量化操作）
+    logger.info("  步驟1: 識別各 partner 類型...")
+    df_tagged = df_partners.with_columns([
+        pl.col("partners").list.contains("OneAD").alias("has_onead"),
+        pl.col("partners").list.contains("os").alias("has_os"),
+    ]).with_columns([
+        (pl.col("has_onead") & pl.col("has_os")).alias("is_cross")
+    ])
 
-        if has_onead:
-            onead_mapping_ids.add(mapping_id)
-        if has_os:
-            os_mapping_ids.add(mapping_id)
+    # 統計基本數據
+    total_unique_mapping_ids = len(df_tagged)
+    total_unique_cids = df_tagged.select("cid").unique().height
 
-        # 找出同時有 OneAD 和 os 的 mapping_id
-        if has_onead and has_os:
-            cross_mapping_ids.append(mapping_id)
+    # OneAD 和 OS 的 mapping_id 數量
+    onead_mapping_count = df_tagged.filter(pl.col("has_onead")).height
+    os_mapping_count = df_tagged.filter(pl.col("has_os")).height
+    cross_mapping_count = df_tagged.filter(pl.col("is_cross")).height
 
-    # 步驟2: 將跨來源的 mapping_id 轉換為 cid（去重）
-    cross_cids = set()
-    cross_cid_details = []  # 記錄詳細資訊供顯示
+    logger.info(f"    OneAD mapping_ids: {onead_mapping_count:,}")
+    logger.info(f"    OS mapping_ids: {os_mapping_count:,}")
+    logger.info(f"    跨來源 mapping_ids: {cross_mapping_count:,}")
 
-    for mapping_id in cross_mapping_ids:
-        cid = mapping_to_cid.get(mapping_id)
-        if cid:
-            if cid not in cross_cids:
-                cross_cid_details.append({
-                    "cid": cid,
-                    "partners": list(mapping_partners[mapping_id])
-                })
-            cross_cids.add(cid)
+    # 步驟2: 計算各類型的唯一 cid 數量
+    logger.info("  步驟2: 計算唯一 cid 數量...")
 
-    # 步驟3: 統計各 partner 的總 cid 數量
-    onead_cids = set()
-    os_cids = set()
-
-    for mapping_id in onead_mapping_ids:
-        cid = mapping_to_cid.get(mapping_id)
-        if cid:
-            onead_cids.add(cid)
-
-    for mapping_id in os_mapping_ids:
-        cid = mapping_to_cid.get(mapping_id)
-        if cid:
-            os_cids.add(cid)
-
-    # 計算獨占客戶（只在一個 partner 出現的）
-    onead_only_cids = onead_cids - os_cids
-    os_only_cids = os_cids - onead_cids
-
-    # 基本統計
-    total_unique_cids = len(set(mapping_to_cid.values()))
-    total_unique_mapping_ids = len(mapping_partners)
+    # OneAD 的所有 cid
+    onead_cids = df_tagged.filter(pl.col("has_onead")).select("cid").unique()
     onead_cid_count = len(onead_cids)
+
+    # OS 的所有 cid
+    os_cids = df_tagged.filter(pl.col("has_os")).select("cid").unique()
     os_cid_count = len(os_cids)
+
+    # 跨來源的 cid
+    cross_cids = df_tagged.filter(pl.col("is_cross")).select("cid").unique()
     cross_cid_count = len(cross_cids)
+
+    logger.info(f"    OneAD 唯一 cids: {onead_cid_count:,}")
+    logger.info(f"    OS 唯一 cids: {os_cid_count:,}")
+    logger.info(f"    跨來源唯一 cids: {cross_cid_count:,}")
+
+    # 步驟3: 計算獨占客戶（使用 anti join）
+    logger.info("  步驟3: 計算獨占客戶...")
+
+    # OneAD 獨占 = OneAD - OS
+    onead_only_cids = onead_cids.join(os_cids, on="cid", how="anti")
     onead_only_count = len(onead_only_cids)
+
+    # OS 獨占 = OS - OneAD
+    os_only_cids = os_cids.join(onead_cids, on="cid", how="anti")
     os_only_count = len(os_only_cids)
 
-    # 計算比例
+    logger.info(f"    OneAD 獨占: {onead_only_count:,}")
+    logger.info(f"    OS 獨占: {os_only_count:,}")
+
+    # 步驟4: 計算比例
+    logger.info("  步驟4: 計算比例...")
     onead_cross_pct = (cross_cid_count / onead_cid_count * 100) if onead_cid_count > 0 else 0
     os_cross_pct = (cross_cid_count / os_cid_count * 100) if os_cid_count > 0 else 0
     total_cross_pct = (cross_cid_count / total_unique_cids * 100) if total_unique_cids > 0 else 0
 
-    # 計算獨占率
     onead_exclusive_pct = (onead_only_count / onead_cid_count * 100) if onead_cid_count > 0 else 0
     os_exclusive_pct = (os_only_count / os_cid_count * 100) if os_cid_count > 0 else 0
+
+    # 步驟5: 準備跨來源 cid 樣本（只取前 20 個）
+    logger.info("  步驟5: 準備跨來源樣本...")
+    cross_cid_details = []
+
+    if cross_cid_count > 0:
+        # 取得跨來源的 cid 及其 partners（限制 20 個以避免轉換太慢）
+        df_cross_sample = (
+            df_tagged
+            .filter(pl.col("is_cross"))
+            .select(["cid", "partners"])
+            .unique(subset="cid")
+            .limit(20)
+        )
+
+        # 只轉換這 20 個樣本
+        for row in df_cross_sample.to_dicts():
+            cross_cid_details.append({
+                "cid": row["cid"],
+                "partners": row["partners"]
+            })
+
+    logger.info("✓ 分析完成")
 
     return {
         "total_unique_mapping_ids": total_unique_mapping_ids,
         "total_unique_cids": total_unique_cids,
-        "cross_mapping_id_count": len(cross_mapping_ids),
+        "cross_mapping_id_count": cross_mapping_count,
         "cross_cid_count": cross_cid_count,
         "onead_total_cids": onead_cid_count,
         "os_total_cids": os_cid_count,
@@ -447,24 +532,30 @@ def main():
     # 載入並聚合資料
     data = load_and_aggregate_from_gcs(bucket_name, project_name, start_date, end_date, force_download)
 
-    if data is None or len(data["mapping_partners"]) == 0:
+    if data is None or len(data["df_partners"]) == 0:
         logger.error("沒有資料可供分析")
         sys.exit(1)
+
+    df_partners = data["df_partners"]
 
     # 顯示資料概況
     logger.info("\n資料概況:")
     logger.info(f"  總記錄數: {data['total_records']:,}")
-    logger.info(f"  唯一 mapping_id 數: {len(data['mapping_partners']):,}")
-    logger.info(f"  唯一 cid 數: {len(set(data['mapping_to_cid'].values())):,}")
+    logger.info(f"  唯一 mapping_id 數: {len(df_partners):,}")
+    logger.info(f"  唯一 cid 數: {df_partners.select('cid').unique().height:,}")
 
-    # 獲取所有唯一的 partner 值
-    all_partners = set()
-    for partners in data["mapping_partners"].values():
-        all_partners.update(partners)
-    logger.info(f"  唯一 partner 列表: {sorted(all_partners)}")
+    # 獲取所有唯一的 partner 值（使用 Polars 操作）
+    all_partners = (
+        df_partners
+        .select(pl.col("partners").explode().unique())
+        .to_series()
+        .sort()
+        .to_list()
+    )
+    logger.info(f"  唯一 partner 列表: {all_partners}")
 
     # 分析重疊
-    results = analyze_partner_overlap(data["mapping_partners"], data["mapping_to_cid"])
+    results = analyze_partner_overlap(df_partners)
 
     # 列印結果
     print_results(results)

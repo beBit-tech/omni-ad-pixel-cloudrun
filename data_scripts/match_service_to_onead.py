@@ -707,9 +707,17 @@ def main():
     # 步驟1: 讀取 CSV
     phone_data = read_csv_and_group_by_phone(CSV_FILE_PATH)
 
-    # 步驟2: 讀取 Parquet 數據
-    parquet_data = load_parquet_data_from_gcs(
-        GCS_BUCKET, GCS_PROJECT, start_date, end_date, force_download
+    # 步驟2: 讀取 Parquet 數據（使用共享緩存）
+    from parquet_data_loader import load_or_cache_parquet_data
+
+    parquet_data = load_or_cache_parquet_data(
+        bucket_name=GCS_BUCKET,
+        project_name=GCS_PROJECT,
+        start_date=start_date,
+        end_date=end_date,
+        force_download=force_download,
+        use_cache=True,
+        save_cache=True,
     )
 
     if parquet_data is None:
